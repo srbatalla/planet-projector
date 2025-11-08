@@ -9,10 +9,11 @@ type ControlState = {
   sampleMinutes: number;
   playbackSpeed: number;
   startTime: Date;
-  trailFade: number;
   jumpSetting: number;
   trailPersistence: number;
   cycleLimit: number;
+  activeFadeRate: number;
+  azimuthCheckpointInterval: number;
 };
 
 const PLANET_OPTIONS: { label: string; value: Body }[] = [
@@ -33,10 +34,11 @@ const DEFAULTS: ControlState = {
   sampleMinutes: 5,
   playbackSpeed: 10000,
   startTime: new Date(),
-  trailFade: 0.2,
-  jumpSetting: 1,
-  trailPersistence: 20,
-  cycleLimit: 8,
+  jumpSetting: 3,
+  trailPersistence: 15,
+  cycleLimit: 0,
+  activeFadeRate: 0.0001,
+  azimuthCheckpointInterval: 10,
 };
 
 const SPEED_STEPS = [1, 1000, 5000, 10000, 20000, 50000, 100000, 500000];
@@ -85,10 +87,17 @@ function updatePlaybackSpeedLabel(root: HTMLElement) {
 }
 
 function formatJumpLabel(setting: number) {
-  if (setting <= 4) {
-    return `${setting} wk${setting === 1 ? '' : 's'}`;
+  if (setting === 1) {
+    return 'None';
   }
-  const monthSteps = setting - 4;
+  if (setting === 2) {
+    return 'Next';
+  }
+  if (setting <= 6) {
+    const weeks = setting - 2;
+    return `${weeks} wk${weeks === 1 ? '' : 's'}`;
+  }
+  const monthSteps = setting - 6;
   return `${monthSteps} mo${monthSteps === 1 ? '' : 's'}`;
 }
 
@@ -100,6 +109,16 @@ function updateJumpLabel(root: HTMLElement) {
   }
   const value = Number(slider.value) || DEFAULTS.jumpSetting;
   display.textContent = formatJumpLabel(value);
+}
+
+function updateAzimuthCheckpointLabel(root: HTMLElement) {
+  const slider = root.querySelector<HTMLInputElement>('input[name="azimuthCheckpointInterval"]');
+  const display = root.querySelector<HTMLElement>('[data-azimuth-checkpoint-display]');
+  if (!slider || !display) {
+    return;
+  }
+  const value = Number(slider.value) || DEFAULTS.azimuthCheckpointInterval;
+  display.textContent = `${value}°`;
 }
 
 export function initializeApp() {
@@ -125,6 +144,7 @@ export function initializeApp() {
   layout.appendChild(controls);
   updateJumpLabel(controls);
   updatePlaybackSpeedLabel(controls);
+  updateAzimuthCheckpointLabel(controls);
 
   const canvasHost = document.createElement('div');
   canvasHost.className = 'canvas-host';
@@ -143,10 +163,11 @@ export function initializeApp() {
       sampleMinutes: state.sampleMinutes,
       startTime: state.startTime,
       playbackSpeed: state.playbackSpeed,
-      trailFade: state.trailFade,
       jumpSetting: state.jumpSetting,
       trailPersistence: state.trailPersistence,
       cycleLimit: state.cycleLimit,
+      activeFadeRate: state.activeFadeRate,
+      azimuthCheckpointInterval: state.azimuthCheckpointInterval,
     });
     view.start();
   };
@@ -162,6 +183,7 @@ export function initializeApp() {
   const scheduleRefresh = () => {
     updateJumpLabel(controls);
     updatePlaybackSpeedLabel(controls);
+    updateAzimuthCheckpointLabel(controls);
     if (refreshHandle !== null) {
       cancelAnimationFrame(refreshHandle);
     }
@@ -243,12 +265,17 @@ function createControls() {
       <small data-speed-display>${formatSpeedLabel(DEFAULTS.playbackSpeed)}</small>
     </label>
     <label>
-      <span>Trail fade rate</span>
-      <input type="number" name="trailFade" min="0" max="1" step="0.01" value="${DEFAULTS.trailFade}" />
+      <span>Active sweep fade rate</span>
+      <input type="number" name="activeFadeRate" min="0" max="0.01" step="0.0001" value="${DEFAULTS.activeFadeRate}" />
+    </label>
+    <label class="slider">
+      <span>Azimuth checkpoint interval</span>
+      <input type="range" name="azimuthCheckpointInterval" min="2" max="30" value="${DEFAULTS.azimuthCheckpointInterval}" />
+      <small data-azimuth-checkpoint-display>${DEFAULTS.azimuthCheckpointInterval}°</small>
     </label>
     <label class="slider">
       <span>Jump interval</span>
-      <input type="range" name="jumpSetting" min="1" max="10" value="${DEFAULTS.jumpSetting}" />
+      <input type="range" name="jumpSetting" min="1" max="12" value="${DEFAULTS.jumpSetting}" />
       <small data-jump-display>${formatJumpLabel(DEFAULTS.jumpSetting)}</small>
     </label>
     <label>
@@ -291,10 +318,11 @@ function readControlState(root: HTMLElement): ControlState {
     elevation: getNumber('input[name="elevation"]', DEFAULTS.elevation),
     sampleMinutes: getNumber('input[name="sampleMinutes"]', DEFAULTS.sampleMinutes, 0.1),
     playbackSpeed,
-    trailFade: Math.min(1, Math.max(0, getNumber('input[name="trailFade"]', DEFAULTS.trailFade))),
-    jumpSetting: Math.min(10, Math.max(1, Math.round(getNumber('input[name="jumpSetting"]', DEFAULTS.jumpSetting, 1)))),
+    jumpSetting: Math.min(12, Math.max(1, Math.round(getNumber('input[name="jumpSetting"]', DEFAULTS.jumpSetting, 1)))),
     trailPersistence: Math.max(1, Math.round(getNumber('input[name="trailPersistence"]', DEFAULTS.trailPersistence, 1))),
     cycleLimit: Math.max(0, Math.round(getNumber('input[name="cycleLimit"]', DEFAULTS.cycleLimit, 0))),
+    activeFadeRate: Math.max(0, getNumber('input[name="activeFadeRate"]', DEFAULTS.activeFadeRate)),
+    azimuthCheckpointInterval: Math.min(30, Math.max(2, Math.round(getNumber('input[name="azimuthCheckpointInterval"]', DEFAULTS.azimuthCheckpointInterval, 2)))),
     startTime: Number.isNaN(startTime.getTime()) ? new Date() : startTime,
   };
 }

@@ -11,10 +11,11 @@ type HorizonViewConfig = {
   sampleMinutes: number;
   startTime: Date;
   playbackSpeed: number;
-  trailFade: number;
   jumpSetting: number;
   trailPersistence: number;
   cycleLimit: number;
+  activeFadeRate: number;
+  azimuthCheckpointInterval: number;
 };
 
 type AltitudeRange = {
@@ -36,6 +37,9 @@ export class HorizonView {
   private readonly altitudeRange: AltitudeRange = { min: -10, max: 90 };
   private readonly stepMs: number;
   private readonly baseTimestamp: number;
+  // Pre-calculated constants for performance
+  private readonly AZIMUTH_TO_NORMALIZED = 1 / 360;
+  private readonly altitudeScale: number;
   private simTimeMs = 0;
   private remainderMs = 0;
   private currentSample: HorizonSample | null = null;
@@ -48,10 +52,26 @@ export class HorizonView {
   private completedCycles = 0;
   private activeHasPaint = false;
   private historyLayers: HistoryLayer[] = [];
+  private staticLayerSize = { width: 0, height: 0 };
+  private gridLayer: HTMLCanvasElement | null = null;
+  private horizonLayer: HTMLCanvasElement | null = null;
+  private historyCanvasPool: HTMLCanvasElement[] = [];
+  private lastAzimuthCheckpoint = 0;
+  private cycleStartAzimuth = 0;
+  private azimuthAgeThisCycle = 0; // Track how much we've aged from azimuth this cycle
+  // Cached dimensions for performance (avoid repeated calculations)
+  private cachedLogicalWidth = 0;
+  private cachedLogicalHeight = 0;
+  // Pruning optimization - only prune every N frames
+  private pruneFrameCounter = 0;
+  private readonly PRUNE_INTERVAL = 10;
+  // Reusable Date object to avoid allocations
+  private readonly reusableDate = new Date();
 
   constructor(private container: HTMLElement, private config: HorizonViewConfig) {
     this.stepMs = Math.max(1, this.config.sampleMinutes * 60 * 1000);
     this.baseTimestamp = this.config.startTime.getTime();
+    this.altitudeScale = 1 / (this.altitudeRange.max - this.altitudeRange.min);
 
     const canvas = document.createElement('canvas');
     canvas.style.display = 'block';
@@ -64,7 +84,10 @@ export class HorizonView {
     this.historyPersistence = Math.max(1, this.config.trailPersistence);
     this.cycleLimit = Math.max(0, this.config.cycleLimit);
 
+    // Update dimension cache BEFORE using it in other methods
+    this.updateDimensionCache();
     this.syncTrailCanvas(this.activeTrail);
+    this.ensureStaticLayers();
     clearTrailLayer(this.activeTrail);
 
     window.addEventListener('resize', this.handleResize, { passive: true });
@@ -106,8 +129,9 @@ export class HorizonView {
     const deltaTime = timestamp - this.lastFrameTime;
     this.lastFrameTime = timestamp;
 
-    this.advanceSimulation(deltaTime * this.config.playbackSpeed);
-    this.render(deltaTime);
+    const deltaSimMs = deltaTime * this.config.playbackSpeed;
+    this.advanceSimulation(deltaSimMs);
+    this.render(deltaTime, deltaSimMs); // Pass both real and simulation time
     this.animationHandle = requestAnimationFrame(this.loop);
   };
 
@@ -166,11 +190,11 @@ export class HorizonView {
   }
 
   private computeSampleAt(simTimeMs: number): HorizonSample {
-    const time = new Date(this.baseTimestamp + simTimeMs);
+    this.reusableDate.setTime(this.baseTimestamp + simTimeMs);
     return computeHorizonPoint({
       body: this.config.body,
       observer: this.config.observer,
-      time,
+      time: this.reusableDate,
     });
   }
 
@@ -188,55 +212,107 @@ export class HorizonView {
         const entryPoint = this.findArcEntryPoint(timeMs);
         this.lastVisibleSample = null;
         this.activeHasPaint = false;
+        // Reset azimuth checkpoint to prevent jolt when warping to new horizon
+        this.lastAzimuthCheckpoint = entryPoint.sample.azimuth;
+        this.cycleStartAzimuth = entryPoint.sample.azimuth;
         return entryPoint;
       }
-      timeMs += this.stepMs;
+
+      // Adaptive stepping: if very far below horizon, jump faster
+      const cutoff = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
+      const depthBelowHorizon = cutoff - sample.altitude;
+      let adaptiveStep = this.stepMs;
+
+      if (depthBelowHorizon > 30) {
+        // Very deep below horizon - jump 6 hours
+        adaptiveStep = 6 * 3600 * 1000;
+      } else if (depthBelowHorizon > 15) {
+        // Moderately deep - jump 2 hours
+        adaptiveStep = 2 * 3600 * 1000;
+      } else if (depthBelowHorizon > 5) {
+        // Somewhat below - jump 30 minutes
+        adaptiveStep = 30 * 60 * 1000;
+      }
+
+      timeMs += adaptiveStep;
     }
 
     return null;
   }
 
   private findArcEntryPoint(foundTimeMs: number): { sample: HorizonSample; timeMs: number } {
-    // Search backward from the found drawable sample to find where it enters from below horizon
-    const searchStepMs = Math.min(this.stepMs, 5 * 60 * 1000); // Use 5 min or smaller
+    // Two-phase search: coarse then fine
+    // Phase 1: Coarse search backward with 30-minute steps
+    const coarseStepMs = 30 * 60 * 1000;
     let timeMs = foundTimeMs;
     let lastDrawable: { sample: HorizonSample; timeMs: number } | null = null;
 
-    // Search backward until we find a non-drawable sample or reach a limit
-    const maxBackwardSteps = Math.ceil((12 * 3600 * 1000) / searchStepMs); // Search back up to 12 hours
-    for (let i = 0; i < maxBackwardSteps; i += 1) {
+    // Coarse search back up to 12 hours
+    const maxCoarseSteps = Math.ceil((12 * 3600 * 1000) / coarseStepMs);
+    for (let i = 0; i < maxCoarseSteps; i += 1) {
       const sample = this.computeSampleAt(timeMs);
       if (!this.isSampleDrawable(sample)) {
-        // Found the boundary - return the last drawable sample we saw
-        return lastDrawable || { sample: this.computeSampleAt(foundTimeMs), timeMs: foundTimeMs };
+        // Found boundary in coarse search - now refine
+        break;
       }
       lastDrawable = { sample, timeMs };
-      timeMs -= searchStepMs;
+      timeMs -= coarseStepMs;
     }
 
-    // If we searched back the full 12 hours and everything was drawable,
-    // just return the earliest point we found
-    return lastDrawable || { sample: this.computeSampleAt(foundTimeMs), timeMs: foundTimeMs };
+    if (!lastDrawable) {
+      return { sample: this.computeSampleAt(foundTimeMs), timeMs: foundTimeMs };
+    }
+
+    // Phase 2: Fine search forward from last coarse position
+    const fineStepMs = Math.min(this.stepMs, 5 * 60 * 1000);
+    timeMs = lastDrawable.timeMs;
+    const endTimeMs = lastDrawable.timeMs + coarseStepMs;
+
+    for (; timeMs <= endTimeMs; timeMs += fineStepMs) {
+      const sample = this.computeSampleAt(timeMs);
+      if (this.isSampleDrawable(sample)) {
+        return { sample, timeMs };
+      }
+    }
+
+    return lastDrawable;
   }
 
   private getJumpMilliseconds() {
     const setting = Math.max(1, this.jumpSetting);
-    if (setting <= 4) {
-      return setting * 7 * 24 * 3600 * 1000;
+
+    // Setting 1: "None" - don't jump, just step forward
+    if (setting === 1) {
+      return this.stepMs;
     }
 
-    const monthSteps = setting - 4; // 1 => 1 month, 2 => 2 months, ...
+    // Setting 2: "Next" - no initial jump, use adaptive seeking only
+    if (setting === 2) {
+      return 0;
+    }
+
+    // Settings 3-6: 1-4 weeks
+    if (setting <= 6) {
+      const weeks = setting - 2;
+      return weeks * 7 * 24 * 3600 * 1000;
+    }
+
+    // Settings 7-12: 1-6 months
+    const monthSteps = setting - 6;
     const months = Math.min(monthSteps, 12);
     return months * 30 * 24 * 3600 * 1000;
   }
 
-  private render(deltaTime: number) {
-    this.fadeTrailLayer(this.activeTrail, deltaTime, this.config.trailFade);
+  private render(deltaTime: number, deltaSimMs: number) {
+    // Fade active trail based on simulation time (scales with playback speed)
+    this.fadeTrailLayer(this.activeTrail, deltaSimMs, this.config.activeFadeRate);
+    this.ageHistoryLayersByAzimuth();
+
     this.surface.clear();
-    this.drawGrid();
+    this.blitStaticLayer(this.gridLayer, 'grid');
     this.drawHistoryLayers();
     this.drawActiveTrail();
-    this.drawHorizonBand();
+    this.blitStaticLayer(this.horizonLayer, 'horizon');
     this.drawAxesLabels(this.getLogicalWidth());
 
     // Always draw info background to prevent flashing
@@ -246,21 +322,6 @@ export class HorizonView {
     if (this.currentSample && this.isSampleVisible(this.currentSample)) {
       this.drawMarker(this.currentSample);
     }
-  }
-
-  private drawGrid() {
-    const ctx = this.surface.context;
-    const height = this.getLogicalHeight();
-
-    ctx.save();
-    for (let az = 0; az < 360; az += 30) {
-      ctx.beginPath();
-      const x = this.mapAzimuth(az);
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, height);
-      ctx.stroke();
-    }
-    ctx.restore();
   }
 
   private drawMarker(sample: HorizonSample) {
@@ -360,19 +421,18 @@ export class HorizonView {
   }
 
   private mapAzimuth(azimuth: number) {
-    const normalized = azimuth / 360;
-    return normalized * this.getLogicalWidth();
+    return azimuth * this.AZIMUTH_TO_NORMALIZED * this.cachedLogicalWidth;
   }
 
   private mapAltitude(altitude: number) {
     const { min, max } = this.altitudeRange;
     const clamped = Math.max(min, Math.min(max, altitude));
-    const ratio = (clamped - min) / (max - min);
-    return this.getLogicalHeight() * (1 - ratio);
+    const ratio = (clamped - min) * this.altitudeScale;
+    return this.cachedLogicalHeight * (1 - ratio);
   }
 
   private unmapAltitude(y: number) {
-    const height = this.getLogicalHeight();
+    const height = this.cachedLogicalHeight;
     const { min, max } = this.altitudeRange;
     if (height <= 0) {
       return min;
@@ -390,57 +450,24 @@ export class HorizonView {
     return this.surface.canvas.height / this.surface.pixelRatio;
   }
 
+  private updateDimensionCache() {
+    this.cachedLogicalWidth = this.getLogicalWidth();
+    this.cachedLogicalHeight = this.getLogicalHeight();
+  }
+
   private handleResize = () => {
     this.surface.resize();
+    this.updateDimensionCache();
     this.syncTrailCanvas(this.activeTrail);
+    this.ensureStaticLayers(true);
     clearTrailLayer(this.activeTrail);
     this.activeHasPaint = false;
     this.lastVisibleSample = null;
+    for (let i = 0; i < this.historyLayers.length; i++) {
+      this.releaseHistoryCanvas(this.historyLayers[i].canvas);
+    }
     this.historyLayers = [];
   };
-
-  private drawHorizonBand() {
-    const ctx = this.surface.context;
-    const width = this.getLogicalWidth();
-    const height = this.getLogicalHeight();
-    const base = this.mapAltitude(0);
-    const gradientDepth = Math.min(80, this.getLogicalHeight() * 0.15);
-
-    ctx.save();
-    ctx.beginPath();
-    this.traceHorizonCurve(ctx, width);
-    ctx.lineTo(width, height);
-    ctx.lineTo(0, height);
-    ctx.closePath();
-    ctx.fillStyle = '#070707';
-    ctx.fill();
-    ctx.restore();
-
-    const glow = ctx.createLinearGradient(0, base - 30, 0, base + gradientDepth);
-    glow.addColorStop(0, 'rgba(255, 255, 255, 0.08)');
-    glow.addColorStop(0.5, 'rgba(255, 255, 255, 0.18)');
-    glow.addColorStop(1, 'rgba(5, 5, 5, 0)');
-
-    ctx.save();
-    ctx.beginPath();
-    this.traceHorizonCurve(ctx, width);
-    const glowBottom = Math.min(height, base + gradientDepth);
-    ctx.lineTo(width, glowBottom);
-    ctx.lineTo(0, glowBottom);
-    ctx.closePath();
-    ctx.clip();
-    ctx.fillStyle = glow;
-    ctx.fillRect(0, base - 40, width, gradientDepth + 40);
-    ctx.restore();
-
-    ctx.save();
-    ctx.beginPath();
-    this.traceHorizonCurve(ctx, width);
-    ctx.strokeStyle = '#2a2a2a';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.restore();
-  }
 
   private traceHorizonCurve(ctx: CanvasRenderingContext2D, width: number) {
     ctx.moveTo(0, this.getCurvedHorizonY(0));
@@ -453,13 +480,13 @@ export class HorizonView {
   }
 
   private getCurvedHorizonY(x: number) {
-    const width = this.getLogicalWidth();
+    const width = this.cachedLogicalWidth;
     const base = this.mapAltitude(0);
     if (width <= 0) {
       return base;
     }
 
-    const amplitude = Math.min(20, this.getLogicalHeight() * 0.03);
+    const amplitude = Math.min(20, this.cachedLogicalHeight * 0.03);
     const normalized = x / width;
     return base - Math.sin(normalized * Math.PI) * amplitude;
   }
@@ -494,23 +521,95 @@ export class HorizonView {
       return false;
     }
 
-    const snapshot = cloneCanvas(this.activeTrail.canvas);
-    this.historyLayers = this.historyLayers
-      .map((layer) => ({ ...layer, age: layer.age + 1 }))
-      .filter((layer) => layer.age < this.historyPersistence);
-    this.historyLayers.push({ canvas: snapshot, age: 0 });
+    const completionBonus = Math.max(0, 1 - this.azimuthAgeThisCycle);
+    this.pruneHistoryLayers();
+
+    // Newly completed stroke starts with whatever fraction of the cycle remained
+    const snapshot = this.acquireHistoryCanvas();
+    const ctx = snapshot.getContext('2d');
+    if (ctx) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, snapshot.width, snapshot.height);
+      ctx.drawImage(
+        this.activeTrail.canvas,
+        0,
+        0,
+        this.activeTrail.canvas.width,
+        this.activeTrail.canvas.height,
+        0,
+        0,
+        snapshot.width,
+        snapshot.height,
+      );
+    }
+    this.historyLayers.push({ canvas: snapshot, age: completionBonus });
+
     clearTrailLayer(this.activeTrail);
     this.activeHasPaint = false;
+
+    const completedSample = this.lastVisibleSample;
     this.lastVisibleSample = null;
+
+    // Reset for new cycle
+    this.azimuthAgeThisCycle = 0;
+    if (completedSample) {
+      this.lastAzimuthCheckpoint = completedSample.azimuth;
+      this.cycleStartAzimuth = completedSample.azimuth;
+    }
+
     return true;
   }
 
-  private fadeTrailLayer(layer: TrailLayer, deltaTime: number, fadeRate: number) {
-    if (deltaTime <= 0 || fadeRate <= 0) {
+  private ageHistoryLayersByAzimuth() {
+    // Only age when we're actively painting - prevents jolts during horizon transitions
+    if (!this.lastVisibleSample || this.historyLayers.length === 0 || !this.activeHasPaint) {
       return;
     }
 
-    const alpha = 1 - Math.exp(-fadeRate * (deltaTime / 1000));
+    const currentAzimuth = this.lastVisibleSample.azimuth;
+
+    // Calculate angular distance, handling 0°/360° wraparound
+    let azimuthDelta = currentAzimuth - this.lastAzimuthCheckpoint;
+    if (azimuthDelta > 180) {
+      azimuthDelta -= 360;
+    } else if (azimuthDelta < -180) {
+      azimuthDelta += 360;
+    }
+
+    const absAzimuthDelta = Math.abs(azimuthDelta);
+
+    // Check if we've crossed a checkpoint threshold
+    if (absAzimuthDelta >= this.config.azimuthCheckpointInterval) {
+      // Calculate how many checkpoints we crossed
+      const checkpointsCrossed = Math.floor(absAzimuthDelta / this.config.azimuthCheckpointInterval);
+
+      // Age increment: full sweep (360°) = 1 age unit
+      // So 10° checkpoint = 10/360 ≈ 0.0278 age units
+      const ageIncrement = (checkpointsCrossed * this.config.azimuthCheckpointInterval) / 360;
+
+      // Age all historical layers
+      for (let i = 0; i < this.historyLayers.length; i++) {
+        this.historyLayers[i].age += ageIncrement;
+      }
+
+      // Track total azimuth aging for this cycle
+      this.azimuthAgeThisCycle += ageIncrement;
+
+      // Update checkpoint
+      this.lastAzimuthCheckpoint = currentAzimuth;
+    }
+  }
+
+  private fadeTrailLayer(layer: TrailLayer, deltaSimMs: number, fadeRate: number) {
+    if (deltaSimMs <= 0 || fadeRate <= 0) {
+      return;
+    }
+
+    // Fade based on simulation time (scales with playback speed)
+    // Use uncapped simulation time to ensure consistent trail length across all playback speeds
+    const simSeconds = deltaSimMs / 1000;
+    const alpha = 1 - Math.exp(-fadeRate * simSeconds);
+
     if (alpha <= 0) {
       return;
     }
@@ -519,26 +618,37 @@ export class HorizonView {
     layer.ctx.globalCompositeOperation = 'destination-out';
     layer.ctx.globalAlpha = Math.min(1, alpha);
     layer.ctx.fillStyle = '#000000';
-    layer.ctx.fillRect(0, 0, this.getLogicalWidth(), this.getLogicalHeight());
+    layer.ctx.fillRect(0, 0, this.cachedLogicalWidth, this.cachedLogicalHeight);
     layer.ctx.restore();
   }
 
   private drawHistoryLayers() {
     const ctx = this.surface.context;
-    const width = this.getLogicalWidth();
-    const height = this.getLogicalHeight();
-    this.historyLayers = this.historyLayers.filter((layer) => layer.age < this.historyPersistence);
+    const width = this.cachedLogicalWidth;
+    const height = this.cachedLogicalHeight;
 
-    this.historyLayers.forEach((layer) => {
-      const alpha = Math.max(0, 1 - layer.age / this.historyPersistence);
-      if (alpha <= 0) {
-        return;
+    // Only prune every N frames to reduce overhead
+    if (++this.pruneFrameCounter >= this.PRUNE_INTERVAL) {
+      this.pruneHistoryLayers();
+      this.pruneFrameCounter = 0;
+    }
+
+    for (let i = 0; i < this.historyLayers.length; i++) {
+      const layer = this.historyLayers[i];
+      // Auto-fade based on age: stays bright longer, fades quickly at end
+      // Using inverse quadratic: 1 - x² keeps values high initially
+      const ageRatio = layer.age / this.historyPersistence;
+      const alpha = 1 - Math.pow(ageRatio, 2);
+
+      // Skip layers that are nearly invisible (performance optimization)
+      if (alpha <= 0.01) {
+        continue;
       }
       ctx.save();
       ctx.globalAlpha = alpha;
       ctx.drawImage(layer.canvas, 0, 0, layer.canvas.width, layer.canvas.height, 0, 0, width, height);
       ctx.restore();
-    });
+    }
   }
 
   private drawActiveTrail() {
@@ -551,8 +661,8 @@ export class HorizonView {
       this.activeTrail.canvas.height,
       0,
       0,
-      this.getLogicalWidth(),
-      this.getLogicalHeight(),
+      this.cachedLogicalWidth,
+      this.cachedLogicalHeight,
     );
   }
 
@@ -565,6 +675,16 @@ export class HorizonView {
     }
   }
 
+  private pruneHistoryLayers() {
+    // Use reverse iteration with splice for in-place filtering (avoids creating new array)
+    for (let i = this.historyLayers.length - 1; i >= 0; i--) {
+      if (this.historyLayers[i].age >= this.historyPersistence) {
+        this.releaseHistoryCanvas(this.historyLayers[i].canvas);
+        this.historyLayers.splice(i, 1);
+      }
+    }
+  }
+
   private restartSimulation() {
     this.simTimeMs = 0;
     this.remainderMs = 0;
@@ -572,6 +692,9 @@ export class HorizonView {
     this.lastVisibleSample = null;
     this.lastVisibleTimeMs = 0;
     this.activeHasPaint = false;
+    for (let i = 0; i < this.historyLayers.length; i++) {
+      this.releaseHistoryCanvas(this.historyLayers[i].canvas);
+    }
     this.historyLayers = [];
     this.completedCycles = 0;
     clearTrailLayer(this.activeTrail);
@@ -602,6 +725,131 @@ export class HorizonView {
     };
   }
 
+  private ensureStaticLayers(force = false) {
+    const width = Math.max(1, Math.floor(this.getLogicalWidth()));
+    const height = Math.max(1, Math.floor(this.getLogicalHeight()));
+    if (!force && this.staticLayerSize.width === width && this.staticLayerSize.height === height) {
+      return;
+    }
+
+    this.staticLayerSize = { width, height };
+    this.gridLayer = this.createOrResizeStaticLayer(this.gridLayer, width, height);
+    this.horizonLayer = this.createOrResizeStaticLayer(this.horizonLayer, width, height);
+    if (this.gridLayer) {
+      this.renderGridLayer(this.gridLayer.getContext('2d')!, width, height);
+    }
+    if (this.horizonLayer) {
+      this.renderHorizonLayer(this.horizonLayer.getContext('2d')!, width, height);
+    }
+    // Drop pool so reused canvases match new resolution
+    this.historyCanvasPool = [];
+  }
+
+  private createOrResizeStaticLayer(
+    layer: HTMLCanvasElement | null,
+    width: number,
+    height: number,
+  ): HTMLCanvasElement {
+    const canvas = layer ?? document.createElement('canvas');
+    const ratio = this.surface.pixelRatio;
+    canvas.width = width * ratio;
+    canvas.height = height * ratio;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(ratio, ratio);
+      ctx.clearRect(0, 0, width, height);
+    }
+    return canvas;
+  }
+
+  private renderGridLayer(ctx: CanvasRenderingContext2D, width: number, height: number) {
+    ctx.save();
+    ctx.clearRect(0, 0, width, height);
+    for (let az = 0; az < 360; az += 30) {
+      ctx.beginPath();
+      const x = az * this.AZIMUTH_TO_NORMALIZED * width;
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.strokeStyle = '#111';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  private renderHorizonLayer(ctx: CanvasRenderingContext2D, width: number, height: number) {
+    ctx.save();
+    ctx.clearRect(0, 0, width, height);
+    const base = this.mapAltitude(0);
+    const gradientDepth = Math.min(80, this.cachedLogicalHeight * 0.15);
+
+    ctx.beginPath();
+    this.traceHorizonCurve(ctx, width);
+    ctx.lineTo(width, height);
+    ctx.lineTo(0, height);
+    ctx.closePath();
+    ctx.fillStyle = '#070707';
+    ctx.fill();
+
+    const glow = ctx.createLinearGradient(0, base - 30, 0, base + gradientDepth);
+    glow.addColorStop(0, 'rgba(255, 255, 255, 0.08)');
+    glow.addColorStop(0.5, 'rgba(255, 255, 255, 0.18)');
+    glow.addColorStop(1, 'rgba(5, 5, 5, 0)');
+    ctx.beginPath();
+    this.traceHorizonCurve(ctx, width);
+    const glowBottom = Math.min(height, base + gradientDepth);
+    ctx.lineTo(width, glowBottom);
+    ctx.lineTo(0, glowBottom);
+    ctx.closePath();
+    ctx.clip();
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, base - 40, width, gradientDepth + 40);
+    ctx.restore();
+
+    ctx.save();
+    ctx.beginPath();
+    this.traceHorizonCurve(ctx, width);
+    ctx.strokeStyle = '#2a2a2a';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  private blitStaticLayer(layer: HTMLCanvasElement | null, type: 'grid' | 'horizon') {
+    if (!layer) {
+      this.ensureStaticLayers();
+      layer = type === 'grid' ? this.gridLayer : this.horizonLayer;
+      if (!layer) {
+        return;
+      }
+    }
+    const ctx = this.surface.context;
+    ctx.drawImage(layer, 0, 0, layer.width, layer.height, 0, 0, this.cachedLogicalWidth, this.cachedLogicalHeight);
+  }
+
+  private acquireHistoryCanvas(): HTMLCanvasElement {
+    const canvas = this.historyCanvasPool.pop() ?? document.createElement('canvas');
+    const targetWidth = this.activeTrail.canvas.width;
+    const targetHeight = this.activeTrail.canvas.height;
+
+    // Only resize if dimensions don't match (avoid unnecessary canvas operations)
+    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+      canvas.style.width = this.activeTrail.canvas.style.width;
+      canvas.style.height = this.activeTrail.canvas.style.height;
+    }
+
+    return canvas;
+  }
+
+  private releaseHistoryCanvas(canvas: HTMLCanvasElement) {
+    this.historyCanvasPool.push(canvas);
+  }
+
   private isSampleVisible(sample: HorizonSample) {
     const cutoff = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
     return sample.altitude >= cutoff;
@@ -623,7 +871,7 @@ export class HorizonView {
 
 /** Trail layer helpers */
 type TrailLayer = { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D };
-type HistoryLayer = { canvas: HTMLCanvasElement; age: number };
+type HistoryLayer = { canvas: HTMLCanvasElement; age: number }; // age is now continuous (float)
 
 const createTrailLayer = (): TrailLayer => {
   const canvas = document.createElement('canvas');
@@ -639,20 +887,6 @@ const clearTrailLayer = (layer: TrailLayer) => {
   layer.ctx.setTransform(1, 0, 0, 1, 0, 0);
   layer.ctx.clearRect(0, 0, layer.canvas.width, layer.canvas.height);
   layer.ctx.restore();
-};
-
-const cloneCanvas = (source: HTMLCanvasElement) => {
-  const canvas = document.createElement('canvas');
-  canvas.width = source.width;
-  canvas.height = source.height;
-  canvas.style.width = source.style.width;
-  canvas.style.height = source.style.height;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    throw new Error('Unable to clone canvas');
-  }
-  ctx.drawImage(source, 0, 0);
-  return canvas;
 };
 
 const lerp = (start: number, end: number, t: number) => start + (end - start) * t;
