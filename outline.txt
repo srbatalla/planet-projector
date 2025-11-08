@@ -1,0 +1,71 @@
+ 
+# 🪐 Planetary Patterns
+
+**Planetary Patterns** is an interactive browser-based visualization that shows how planets move in the sky — both as elegant *spirograph-like flowers* and as *long-exposure horizon streaks*.  
+It blends astronomy, mathematics, and digital art into a lightweight web app that runs entirely in the user’s browser.
+
+---
+
+## ✨ Features
+
+- **Two core views**
+  - **Spirograph View:** Planet’s apparent motion relative to Earth (geocentric/ecliptic projection).
+  - **Horizon Streak View:** Planet’s path across the sky as seen from any Earth latitude.
+- **Two precision modes**
+  - **Artistic (Toy):** Simple circular orbits; fast and geometric.
+  - **Physical (Ephemeris):** Real orbital data via the [Astronomy Engine](https://github.com/cosinekitty/astronomy) for scientifically accurate motion.
+- **Minimalist Aesthetic:** Pure black-and-white UI, colored only by the planet trails.
+- **Interactive Controls:** Choose planet, duration, timestep, precision, colors, and theme.
+- **Export Options:**
+  - PNG snapshots (client-side)
+  - Short WebM/GIF animations (client-side)
+
+  - GIF generation performed on device
+  - Optional HQ video server API (Node + ffmpeg). Short vids; ~20 seconds. Later down the line.
+  - Users configure their runs via JSON. Capability to share and load runs via sharable link.
+
+---
+
+## 🧭 Project Goals
+
+| Type | Goal |
+|------|------|
+| **Primary** | Educational + artistic visualization of planetary motion |
+| **Secondary** | Offline-capable, lightweight, fast rendering |
+| **Technical** | Deterministic rendering from fixed params; modular math core |
+| **Aesthetic** | Monochrome UI; color only in celestial trails |
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|------------|-------------|
+| Language | **TypeScript** |
+| Build Tool | **Vite** |
+| Renderer | **Canvas 2D** (no WebGL needed) |
+| Ephemeris Library | [Astronomy Engine (JS)](https://github.com/cosinekitty/astronomy) |
+| Workers | Web Worker + OffscreenCanvas |
+| Export | MediaRecorder / gifenc (client) • ffmpeg (server optional) |
+| Hosting | Static (Cloudflare Pages / GitHub Pages) |
+| Optional Backend | Node + Express + ffmpeg + R2/S3 storage |
+
+---
+
+## 🗂 Folder Structure
+
+
+
+planet_projector/
+├── public/ # Static assets and index.html
+├── src/
+│ ├── core/ # Math, ephemeris, time, coordinate transforms
+│ ├── views/ # spirograph/, horizon/
+│ ├── render/ # canvas utils, grid, color, export
+│ ├── ui/ # controls, components, theme
+│ ├── workers/ # Web Workers for background math
+│ └── app.ts # app bootstrap and routing
+├── tests/ # unit tests for math and ephemeris
+├── vite.config.ts
+└── README.md
+
