@@ -33,7 +33,7 @@ const DEFAULTS: ControlState = {
   longitude: -122.4194,
   elevation: 0,
   sampleMinutes: 5,
-  playbackSpeed: 12000,
+  playbackSpeed: 1000,
   startTime: new Date(),
   horizonCutoff: 0,
   autoHorizon: true,
@@ -42,6 +42,60 @@ const DEFAULTS: ControlState = {
   trailPersistence: 20,
   cycleLimit: 8,
 };
+
+function sliderToSpeed(sliderValue: number): number {
+  // Base-10 log scale: slider 1-7 -> speeds 1x, 10x, 100x, 1k, 10k, 100k, 1M
+  // Formula: speed = 10^(slider-1)
+  const exponent = sliderValue - 1;
+  const speed = Math.pow(10, exponent);
+  return Math.max(1, Math.round(speed));
+}
+
+function speedToSlider(speed: number): number {
+  // Inverse of sliderToSpeed
+  const exponent = Math.log10(Math.max(1, speed));
+  const slider = Math.round(exponent + 1);
+  return Math.max(1, Math.min(7, slider));
+}
+
+function formatSpeedLabel(speed: number): string {
+  if (speed >= 1000000) {
+    return `${(speed / 1000000).toFixed(0)}M×`;
+  }
+  if (speed >= 1000) {
+    return `${(speed / 1000).toFixed(0)}k×`;
+  }
+  return `${speed}×`;
+}
+
+function updatePlaybackSpeedLabel(root: HTMLElement) {
+  const slider = root.querySelector<HTMLInputElement>('input[name="playbackSpeed"]');
+  const display = root.querySelector<HTMLElement>('[data-speed-display]');
+  if (!slider || !display) {
+    return;
+  }
+  const sliderValue = Number(slider.value) || speedToSlider(DEFAULTS.playbackSpeed);
+  const speed = sliderToSpeed(sliderValue);
+  display.textContent = formatSpeedLabel(speed);
+}
+
+function formatJumpLabel(setting: number) {
+  if (setting <= 4) {
+    return `${setting} wk${setting === 1 ? '' : 's'}`;
+  }
+  const monthSteps = setting - 4;
+  return `${monthSteps} mo${monthSteps === 1 ? '' : 's'}`;
+}
+
+function updateJumpLabel(root: HTMLElement) {
+  const slider = root.querySelector<HTMLInputElement>('input[name="jumpSetting"]');
+  const display = root.querySelector<HTMLElement>('[data-jump-display]');
+  if (!slider || !display) {
+    return;
+  }
+  const value = Number(slider.value) || DEFAULTS.jumpSetting;
+  display.textContent = formatJumpLabel(value);
+}
 
 export function initializeApp() {
   const target = document.querySelector<HTMLDivElement>('#app');
@@ -65,6 +119,7 @@ export function initializeApp() {
   const controls = createControls();
   layout.appendChild(controls);
   updateJumpLabel(controls);
+  updatePlaybackSpeedLabel(controls);
 
   const canvasHost = document.createElement('div');
   canvasHost.className = 'canvas-host';
@@ -93,9 +148,17 @@ export function initializeApp() {
     view.start();
   };
 
+  const updatePlaybackSpeed = () => {
+    if (view) {
+      const state = readControlState(controls);
+      view.updatePlaybackSpeed(state.playbackSpeed);
+    }
+  };
+
   let refreshHandle: number | null = null;
   const scheduleRefresh = () => {
     updateJumpLabel(controls);
+    updatePlaybackSpeedLabel(controls);
     if (refreshHandle !== null) {
       cancelAnimationFrame(refreshHandle);
     }
@@ -105,8 +168,24 @@ export function initializeApp() {
     });
   };
 
-  controls.addEventListener('input', scheduleRefresh);
-  controls.addEventListener('change', scheduleRefresh);
+  controls.addEventListener('input', (event) => {
+    const target = event.target as HTMLElement;
+    if (target.getAttribute('name') === 'playbackSpeed') {
+      updatePlaybackSpeedLabel(controls);
+      updatePlaybackSpeed();
+    } else {
+      scheduleRefresh();
+    }
+  });
+  controls.addEventListener('change', (event) => {
+    const target = event.target as HTMLElement;
+    if (target.getAttribute('name') === 'playbackSpeed') {
+      updatePlaybackSpeedLabel(controls);
+      updatePlaybackSpeed();
+    } else {
+      scheduleRefresh();
+    }
+  });
   controls.addEventListener('submit', (event) => {
     event.preventDefault();
     scheduleRefresh();
@@ -155,9 +234,10 @@ function createControls() {
       <span>Sample step (min)</span>
       <input type="number" name="sampleMinutes" min="0.1" step="0.5" value="${DEFAULTS.sampleMinutes}" />
     </label>
-    <label>
-      <span>Playback speed (×)</span>
-      <input type="number" name="playbackSpeed" min="1" step="1" value="${DEFAULTS.playbackSpeed}" />
+    <label class="slider">
+      <span>Playback speed</span>
+      <input type="range" name="playbackSpeed" min="1" max="7" value="${speedToSlider(DEFAULTS.playbackSpeed)}" />
+      <small data-speed-display>${formatSpeedLabel(DEFAULTS.playbackSpeed)}</small>
     </label>
     <label>
       <span>Horizon cutoff (°)</span>
@@ -205,13 +285,17 @@ function readControlState(root: HTMLElement): ControlState {
   const startValue = root.querySelector<HTMLInputElement>('input[name="startTime"]')?.value;
   const startTime = startValue ? new Date(startValue) : new Date();
 
+  const playbackSlider = root.querySelector<HTMLInputElement>('input[name="playbackSpeed"]');
+  const playbackSliderValue = playbackSlider ? Number(playbackSlider.value) : speedToSlider(DEFAULTS.playbackSpeed);
+  const playbackSpeed = sliderToSpeed(playbackSliderValue);
+
   return {
     planet: planet ?? DEFAULTS.planet,
     latitude: getNumber('input[name="latitude"]', DEFAULTS.latitude),
     longitude: getNumber('input[name="longitude"]', DEFAULTS.longitude),
     elevation: getNumber('input[name="elevation"]', DEFAULTS.elevation),
     sampleMinutes: getNumber('input[name="sampleMinutes"]', DEFAULTS.sampleMinutes, 0.1),
-    playbackSpeed: getNumber('input[name="playbackSpeed"]', DEFAULTS.playbackSpeed, 1),
+    playbackSpeed,
     autoHorizon: !!root.querySelector<HTMLInputElement>('input[name="autoHorizon"]')?.checked,
     horizonCutoff: getNumber('input[name="horizonCutoff"]', DEFAULTS.horizonCutoff),
     trailFade: Math.min(1, Math.max(0, getNumber('input[name="trailFade"]', DEFAULTS.trailFade))),
@@ -220,24 +304,6 @@ function readControlState(root: HTMLElement): ControlState {
     cycleLimit: Math.max(0, Math.round(getNumber('input[name="cycleLimit"]', DEFAULTS.cycleLimit, 0))),
     startTime: Number.isNaN(startTime.getTime()) ? new Date() : startTime,
   };
-}
-
-function formatJumpLabel(setting: number) {
-  if (setting <= 4) {
-    return `${setting} wk${setting === 1 ? '' : 's'}`;
-  }
-  const monthSteps = setting - 4;
-  return `${monthSteps} mo${monthSteps === 1 ? '' : 's'}`;
-}
-
-function updateJumpLabel(root: HTMLElement) {
-  const slider = root.querySelector<HTMLInputElement>('input[name="jumpSetting"]');
-  const display = root.querySelector<HTMLElement>('[data-jump-display]');
-  if (!slider || !display) {
-    return;
-  }
-  const value = Number(slider.value) || DEFAULTS.jumpSetting;
-  display.textContent = formatJumpLabel(value);
 }
 
 function toDatetimeLocal(date: Date) {

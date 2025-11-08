@@ -77,6 +77,15 @@ export class HorizonView {
       return;
     }
 
+    // Initialize: if starting with a visible planet, find the arc entry point
+    const initialSample = this.computeSampleAt(this.simTimeMs);
+    if (this.isSampleDrawable(initialSample)) {
+      const entryPoint = this.findArcEntryPoint(this.simTimeMs);
+      this.simTimeMs = entryPoint.timeMs;
+      this.lastVisibleSample = entryPoint.sample;
+      this.lastVisibleTimeMs = entryPoint.timeMs;
+    }
+
     this.animationHandle = requestAnimationFrame(this.loop);
   }
 
@@ -85,6 +94,10 @@ export class HorizonView {
       cancelAnimationFrame(this.animationHandle);
       this.animationHandle = null;
     }
+  }
+
+  updatePlaybackSpeed(newSpeed: number) {
+    this.config.playbackSpeed = Math.max(1, newSpeed);
   }
 
   private loop = (timestamp: number) => {
@@ -112,33 +125,24 @@ export class HorizonView {
       this.processStep(this.stepMs);
     }
 
+    // Update current sample for marker display
     const previewTime = this.simTimeMs + this.remainderMs;
     const previewSample = this.computeSampleAt(previewTime);
-    if (this.isSampleVisible(previewSample)) {
-      this.currentSample = previewSample;
-    } else {
-      const nextVisible = this.seekNextVisibleSample(previewTime);
-      this.currentSample = nextVisible?.sample ?? null;
-      if (nextVisible) {
-        this.simTimeMs = nextVisible.timeMs;
-        this.remainderMs = 0;
-      }
-    }
+    this.currentSample = this.isSampleVisible(previewSample) ? previewSample : null;
   }
 
   private processStep(stepMs: number) {
     this.simTimeMs += stepMs;
 
-    let sample = this.computeSampleAt(this.simTimeMs);
-    if (!this.isSampleVisible(sample)) {
+    const sample = this.computeSampleAt(this.simTimeMs);
+    const isDrawable = this.isSampleDrawable(sample);
+    const isVisible = this.isSampleVisible(sample);
+
+    // If too far below horizon, skip ahead
+    if (!isDrawable) {
       if (this.lastVisibleSample) {
-        const exitPoint = this.refineHorizonCrossing(
-          { timeMs: this.lastVisibleTimeMs, sample: this.lastVisibleSample },
-          { timeMs: this.simTimeMs, sample },
-        );
-        this.paintSegment(this.lastVisibleSample, exitPoint.sample, this.activeTrail, true);
-        this.lastVisibleSample = null;
         this.completeCycle();
+        this.lastVisibleSample = null;
       }
 
       const nextVisible = this.seekNextVisibleSample(this.simTimeMs);
@@ -149,16 +153,18 @@ export class HorizonView {
 
       this.simTimeMs = nextVisible.timeMs;
       this.remainderMs = 0;
-      sample = nextVisible.sample;
+      this.currentSample = nextVisible.sample;
+      return;
     }
 
+    // Draw segment even if slightly below horizon - horizon band will occlude it
     if (this.lastVisibleSample) {
-      this.paintSegment(this.lastVisibleSample, sample, this.activeTrail, false);
+      this.paintSegment(this.lastVisibleSample, sample, this.activeTrail);
     }
 
     this.lastVisibleSample = sample;
     this.lastVisibleTimeMs = this.simTimeMs;
-    this.currentSample = sample;
+    this.currentSample = isVisible ? sample : null; // Only show marker if truly visible
   }
 
   private computeSampleAt(simTimeMs: number): HorizonSample {
@@ -177,110 +183,42 @@ export class HorizonView {
     );
 
     let timeMs = fromTimeMs + jumpMs;
-    let below: { timeMs: number; sample: HorizonSample } | null = null;
     for (let i = 0; i < maxIterations; i += 1) {
       const sample = this.computeSampleAt(timeMs);
-      if (this.isSampleVisible(sample)) {
-        let resultTime = timeMs;
-        let resultSample = sample;
-        if (below) {
-          const refined = this.refineHorizonCrossing(below, { timeMs, sample });
-          resultTime = refined.timeMs;
-          resultSample = refined.sample;
-        }
+      if (this.isSampleDrawable(sample)) {
+        // Found a drawable sample - now search backward to find the actual entry point
+        const entryPoint = this.findArcEntryPoint(timeMs);
         this.lastVisibleSample = null;
         this.activeHasPaint = false;
-        return { sample: resultSample, timeMs: resultTime };
+        return entryPoint;
       }
-
-      below = { timeMs, sample };
       timeMs += this.stepMs;
     }
 
     return null;
   }
 
-  private refineHorizonCrossing(
-    below: { timeMs: number; sample: HorizonSample },
-    above: { timeMs: number; sample: HorizonSample },
-  ) {
-    let low = below.timeMs;
-    let high = above.timeMs;
-    let lowSample = below.sample;
-    let highSample = above.sample;
+  private findArcEntryPoint(foundTimeMs: number): { sample: HorizonSample; timeMs: number } {
+    // Search backward from the found drawable sample to find where it enters from below horizon
+    const searchStepMs = Math.min(this.stepMs, 5 * 60 * 1000); // Use 5 min or smaller
+    let timeMs = foundTimeMs;
+    let lastDrawable: { sample: HorizonSample; timeMs: number } | null = null;
 
-    // Binary search to narrow down the crossing
-    for (let i = 0; i < 20 && high - low > 1000; i += 1) {
-      const mid = (low + high) / 2;
-      const midSample = this.computeSampleAt(mid);
-      if (this.isSampleVisible(midSample)) {
-        high = mid;
-        highSample = midSample;
-      } else {
-        low = mid;
-        lowSample = midSample;
+    // Search backward until we find a non-drawable sample or reach a limit
+    const maxBackwardSteps = Math.ceil((12 * 3600 * 1000) / searchStepMs); // Search back up to 12 hours
+    for (let i = 0; i < maxBackwardSteps; i += 1) {
+      const sample = this.computeSampleAt(timeMs);
+      if (!this.isSampleDrawable(sample)) {
+        // Found the boundary - return the last drawable sample we saw
+        return lastDrawable || { sample: this.computeSampleAt(foundTimeMs), timeMs: foundTimeMs };
       }
+      lastDrawable = { sample, timeMs };
+      timeMs -= searchStepMs;
     }
 
-    // Interpolate to find exact horizon crossing point
-    const crossingSample = this.findExactHorizonCrossing(lowSample, highSample);
-    const crossingTime = this.interpolateTime(low, high, lowSample, highSample, crossingSample);
-
-    return { timeMs: crossingTime, sample: crossingSample };
-  }
-
-  private findExactHorizonCrossing(
-    below: HorizonSample,
-    above: HorizonSample,
-  ): HorizonSample {
-    // Get horizon cutoffs at both azimuths
-    const cutoffBelow = this.getHorizonCutoffForAzimuth(below.azimuth);
-    const cutoffAbove = this.getHorizonCutoffForAzimuth(above.azimuth);
-
-    // Interpolate azimuth linearly
-    const azimuthDelta = ((((above.azimuth - below.azimuth) % 360) + 540) % 360) - 180;
-
-    // Find t where interpolated altitude equals interpolated horizon cutoff
-    // altitude(t) = lerp(below.altitude, above.altitude, t)
-    // cutoff(t) = lerp(cutoffBelow, cutoffAbove, t)
-    // Solve: lerp(below.altitude, above.altitude, t) = lerp(cutoffBelow, cutoffAbove, t)
-
-    const altDelta = above.altitude - below.altitude;
-    const cutoffDelta = cutoffAbove - cutoffBelow;
-    const numerator = cutoffBelow - below.altitude;
-    const denominator = altDelta - cutoffDelta;
-
-    // Handle edge cases
-    let t = 0.5;
-    if (Math.abs(denominator) > 1e-6) {
-      t = numerator / denominator;
-      t = Math.max(0, Math.min(1, t)); // Clamp to [0, 1]
-    }
-
-    const crossingAzimuth = wrapAngle(below.azimuth + azimuthDelta * t);
-    const crossingAltitude = below.altitude + altDelta * t;
-
-    return {
-      time: new Date(below.time.getTime() + (above.time.getTime() - below.time.getTime()) * t),
-      azimuth: crossingAzimuth,
-      altitude: crossingAltitude,
-    };
-  }
-
-  private interpolateTime(
-    lowTime: number,
-    highTime: number,
-    lowSample: HorizonSample,
-    highSample: HorizonSample,
-    crossingSample: HorizonSample,
-  ): number {
-    // Interpolate time based on altitude change
-    const altDelta = highSample.altitude - lowSample.altitude;
-    if (Math.abs(altDelta) < 1e-6) {
-      return (lowTime + highTime) / 2;
-    }
-    const t = (crossingSample.altitude - lowSample.altitude) / altDelta;
-    return lowTime + (highTime - lowTime) * Math.max(0, Math.min(1, t));
+    // If we searched back the full 12 hours and everything was drawable,
+    // just return the earliest point we found
+    return lastDrawable || { sample: this.computeSampleAt(foundTimeMs), timeMs: foundTimeMs };
   }
 
   private getJumpMilliseconds() {
@@ -302,9 +240,13 @@ export class HorizonView {
     this.drawActiveTrail();
     this.drawHorizonBand();
     this.drawAxesLabels(this.getLogicalWidth());
+
+    // Always draw info background to prevent flashing
+    this.drawInfo(this.currentSample);
+
+    // Only draw marker when planet is visible
     if (this.currentSample && this.isSampleVisible(this.currentSample)) {
       this.drawMarker(this.currentSample);
-      this.drawInfo(this.currentSample);
     }
   }
 
@@ -337,21 +279,44 @@ export class HorizonView {
     ctx.restore();
   }
 
-  private drawInfo(sample: HorizonSample) {
+  private drawInfo(sample: HorizonSample | null) {
     const ctx = this.surface.context;
+    const height = this.getLogicalHeight();
+
     ctx.save();
-    ctx.fillStyle = '#b8b8b8';
     ctx.font = '12px "JetBrains Mono", "Fira Code", monospace';
 
-    const elapsed = this.formatElapsedTime(sample.time);
-    const label = [
-      `Planet: ${this.config.body}`,
-      `Observer: ${this.formatObserver(this.config.observer)}`,
-      `Start (UTC): ${this.config.startTime.toISOString().slice(0, 16)}`,
-      `Frame (UTC): ${sample.time.toISOString().slice(0, 19)}`,
-      `Elapsed: ${elapsed}`,
-    ].join('  ·  ');
-    ctx.fillText(label, 0, this.getLogicalHeight() - 12);
+    const textY = height - 12;
+    const padding = 8;
+
+    // Build info text
+    let label: string;
+    if (sample && this.isSampleVisible(sample)) {
+      const elapsed = this.formatElapsedTime(sample.time);
+      label = [
+        `Planet: ${this.config.body}`,
+        `Observer: ${this.formatObserver(this.config.observer)}`,
+        `Start (UTC): ${this.config.startTime.toISOString().slice(0, 16)}`,
+        `Frame (UTC): ${sample.time.toISOString().slice(0, 19)}`,
+        `Elapsed: ${elapsed}`,
+      ].join('  ·  ');
+    } else {
+      // Show static info when planet not visible
+      label = [
+        `Planet: ${this.config.body}`,
+        `Observer: ${this.formatObserver(this.config.observer)}`,
+        `Start (UTC): ${this.config.startTime.toISOString().slice(0, 16)}`,
+        'Waiting for next visible arc...',
+      ].join('  ·  ');
+    }
+
+    // Draw text with shadow for visibility over horizon gradient
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
+    ctx.shadowBlur = 6;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+    ctx.fillStyle = '#e8e8e8';
+    ctx.fillText(label, padding, textY);
     ctx.restore();
   }
 
@@ -501,15 +466,14 @@ export class HorizonView {
     return base - Math.sin(normalized * Math.PI) * amplitude;
   }
 
-  private paintSegment(a: HorizonSample, b: HorizonSample, layer: TrailLayer, clampEdges: boolean) {
+  private paintSegment(a: HorizonSample, b: HorizonSample, layer: TrailLayer) {
     const azDelta = Math.abs(b.azimuth - a.azimuth);
     if (azDelta > 180) {
-      return;
+      return; // Avoid wrapping artifacts
     }
 
-    // Subdivide segments near the horizon for smoother appearance
-    const horizonThreshold = 3; // degrees - subdivide if within this range of horizon
-    const needsSubdivision = this.segmentNeedsSubdivision(a, b, horizonThreshold);
+    const start = this.toCanvasPoint(a);
+    const end = this.toCanvasPoint(b);
 
     layer.ctx.save();
     layer.ctx.lineWidth = 2;
@@ -517,110 +481,14 @@ export class HorizonView {
     layer.ctx.lineCap = 'round';
     layer.ctx.strokeStyle = '#e5e5e5';
     layer.ctx.beginPath();
-
-    if (needsSubdivision || clampEdges) {
-      this.paintSubdividedSegment(a, b, layer, clampEdges);
-    } else {
-      const start = this.toCanvasPoint(a);
-      const end = this.toCanvasPoint(b);
-      layer.ctx.moveTo(start.x, start.y);
-      layer.ctx.lineTo(end.x, end.y);
-    }
-
+    layer.ctx.moveTo(start.x, start.y);
+    layer.ctx.lineTo(end.x, end.y);
     layer.ctx.stroke();
     layer.ctx.restore();
 
     if (layer === this.activeTrail) {
       this.activeHasPaint = true;
     }
-  }
-
-  private segmentNeedsSubdivision(a: HorizonSample, b: HorizonSample, threshold: number): boolean {
-    const cutoffA = this.getHorizonCutoffForAzimuth(a.azimuth);
-    const cutoffB = this.getHorizonCutoffForAzimuth(b.azimuth);
-    const distA = Math.abs(a.altitude - cutoffA);
-    const distB = Math.abs(b.altitude - cutoffB);
-    return distA < threshold || distB < threshold;
-  }
-
-  private paintSubdividedSegment(
-    a: HorizonSample,
-    b: HorizonSample,
-    layer: TrailLayer,
-    clipToHorizon: boolean,
-  ) {
-    const subdivisions = 16; // Increased for smoother curves
-    let firstPoint = true;
-    let lastWasBelow = false;
-
-    for (let i = 0; i <= subdivisions; i += 1) {
-      const t = i / subdivisions;
-      const interpolated = interpolateSample(a, b, t);
-      const cutoff = this.getHorizonCutoffForAzimuth(interpolated.azimuth);
-      const isBelow = interpolated.altitude < cutoff;
-
-      if (clipToHorizon && isBelow) {
-        // If transitioning from above to below, draw to horizon crossing first
-        if (!lastWasBelow && !firstPoint && i > 0) {
-          const prevT = (i - 1) / subdivisions;
-          const prevInterpolated = interpolateSample(a, b, prevT);
-          const crossingPoint = this.findHorizonCrossingBetweenPoints(prevInterpolated, interpolated);
-          const crossingCanvas = this.toCanvasPoint(crossingPoint);
-          layer.ctx.lineTo(crossingCanvas.x, crossingCanvas.y);
-        }
-        lastWasBelow = true;
-        firstPoint = true;
-        continue;
-      }
-
-      // If transitioning from below to above, start at horizon crossing
-      if (!isBelow && lastWasBelow && i > 0) {
-        const prevT = (i - 1) / subdivisions;
-        const prevInterpolated = interpolateSample(a, b, prevT);
-        const crossingPoint = this.findHorizonCrossingBetweenPoints(prevInterpolated, interpolated);
-        const crossingCanvas = this.toCanvasPoint(crossingPoint);
-        layer.ctx.moveTo(crossingCanvas.x, crossingCanvas.y);
-        firstPoint = false;
-      }
-
-      const canvasPoint = this.toCanvasPoint(interpolated);
-
-      if (firstPoint) {
-        layer.ctx.moveTo(canvasPoint.x, canvasPoint.y);
-        firstPoint = false;
-      } else {
-        layer.ctx.lineTo(canvasPoint.x, canvasPoint.y);
-      }
-
-      lastWasBelow = isBelow;
-    }
-  }
-
-  private findHorizonCrossingBetweenPoints(
-    below: SamplePoint,
-    above: SamplePoint,
-  ): SamplePoint {
-    const cutoffBelow = this.getHorizonCutoffForAzimuth(below.azimuth);
-    const cutoffAbove = this.getHorizonCutoffForAzimuth(above.azimuth);
-
-    const altDelta = above.altitude - below.altitude;
-    const cutoffDelta = cutoffAbove - cutoffBelow;
-    const numerator = cutoffBelow - below.altitude;
-    const denominator = altDelta - cutoffDelta;
-
-    let t = 0.5;
-    if (Math.abs(denominator) > 1e-6) {
-      t = numerator / denominator;
-      t = Math.max(0, Math.min(1, t));
-    }
-
-    const crossingAzimuth = interpolateAzimuth(below.azimuth, above.azimuth, t);
-    const crossingAltitude = below.altitude + altDelta * t;
-
-    return {
-      azimuth: crossingAzimuth,
-      altitude: crossingAltitude,
-    };
   }
 
   private commitActiveTrailToHistory() {
@@ -739,6 +607,13 @@ export class HorizonView {
   private isSampleVisible(sample: HorizonSample) {
     const cutoff = this.getHorizonCutoffForAzimuth(sample.azimuth);
     return sample.altitude >= cutoff;
+  }
+
+  private isSampleDrawable(sample: HorizonSample) {
+    // Allow drawing slightly below horizon - the horizon band will occlude it
+    const cutoff = this.getHorizonCutoffForAzimuth(sample.azimuth);
+    const tolerance = 5; // degrees below horizon we'll still draw
+    return sample.altitude >= cutoff - tolerance;
   }
 
   private getHorizonCutoffForAzimuth(azimuth: number) {
