@@ -67,6 +67,9 @@ export class HorizonView {
   private readonly PRUNE_INTERVAL = 10;
   // Reusable Date object to avoid allocations
   private readonly reusableDate = new Date();
+  // FPS tracking
+  private fpsFrameTimes: number[] = [];
+  private fps = 0;
 
   constructor(private container: HTMLElement, private config: HorizonViewConfig) {
     this.stepMs = Math.max(1, this.config.sampleMinutes * 60 * 1000);
@@ -129,6 +132,9 @@ export class HorizonView {
     const deltaTime = timestamp - this.lastFrameTime;
     this.lastFrameTime = timestamp;
 
+    // Update FPS calculation
+    this.updateFPS(deltaTime);
+
     const deltaSimMs = deltaTime * this.config.playbackSpeed;
     this.advanceSimulation(deltaSimMs);
     this.render(deltaTime, deltaSimMs); // Pass both real and simulation time
@@ -160,13 +166,21 @@ export class HorizonView {
     const isDrawable = this.isSampleDrawable(sample);
     const isVisible = this.isSampleVisible(sample);
 
-    // If too far below horizon, skip ahead
+    // If too far below horizon, handle based on jump setting
     if (!isDrawable) {
       if (this.lastVisibleSample) {
         this.completeCycle();
         this.lastVisibleSample = null;
       }
 
+      // Jump setting 1 ("None"): continue naturally without jumping forward in time
+      // The simulation will keep advancing and the planet will eventually rise again
+      if (this.jumpSetting === 1) {
+        this.currentSample = null;
+        return;
+      }
+
+      // Other jump settings: seek forward to next visible arc
       const nextVisible = this.seekNextVisibleSample(this.simTimeMs);
       if (!nextVisible) {
         this.currentSample = null;
@@ -313,7 +327,7 @@ export class HorizonView {
     this.drawHistoryLayers();
     this.drawActiveTrail();
     this.blitStaticLayer(this.horizonLayer, 'horizon');
-    this.drawAxesLabels(this.getLogicalWidth());
+    this.drawAxesLabels(this.cachedLogicalWidth);
 
     // Always draw info background to prevent flashing
     this.drawInfo(this.currentSample);
@@ -322,6 +336,9 @@ export class HorizonView {
     if (this.currentSample && this.isSampleVisible(this.currentSample)) {
       this.drawMarker(this.currentSample);
     }
+
+    // Draw FPS counter
+    this.drawFPS();
   }
 
   private drawMarker(sample: HorizonSample) {
@@ -359,8 +376,19 @@ export class HorizonView {
         `Frame (UTC): ${sample.time.toISOString().slice(0, 19)}`,
         `Elapsed: ${elapsed}`,
       ].join('  ·  ');
+    } else if (this.jumpSetting === 1) {
+      // Jump setting "None": show real-time info even when planet not visible
+      const currentTime = new Date(this.baseTimestamp + this.simTimeMs + this.remainderMs);
+      const elapsed = this.formatElapsedTime(currentTime);
+      label = [
+        `Planet: ${this.config.body}`,
+        `Observer: ${this.formatObserver(this.config.observer)}`,
+        `Start (UTC): ${this.config.startTime.toISOString().slice(0, 16)}`,
+        `Frame (UTC): ${currentTime.toISOString().slice(0, 19)}`,
+        `Elapsed: ${elapsed}`,
+      ].join('  ·  ');
     } else {
-      // Show static info when planet not visible
+      // Other jump settings: show waiting message when planet not visible
       label = [
         `Planet: ${this.config.body}`,
         `Observer: ${this.formatObserver(this.config.observer)}`,
@@ -418,6 +446,33 @@ export class HorizonView {
     parts.push(`${minutes.toString().padStart(2, '0')}m`);
     parts.push(`${seconds.toString().padStart(2, '0')}s`);
     return parts.join(' ');
+  }
+
+  private updateFPS(deltaTime: number) {
+    // Track frame times for rolling average (keep last 60 frames)
+    this.fpsFrameTimes.push(deltaTime);
+    if (this.fpsFrameTimes.length > 60) {
+      this.fpsFrameTimes.shift();
+    }
+
+    // Calculate average FPS
+    if (this.fpsFrameTimes.length > 0) {
+      const avgDelta = this.fpsFrameTimes.reduce((a, b) => a + b, 0) / this.fpsFrameTimes.length;
+      this.fps = avgDelta > 0 ? Math.round(1000 / avgDelta) : 0;
+    }
+  }
+
+  private drawFPS() {
+    const ctx = this.surface.context;
+    ctx.save();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 16px "JetBrains Mono", "Fira Code", monospace';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    const padding = 12;
+    const text = `${this.fps} FPS`;
+    ctx.fillText(text, this.cachedLogicalWidth - padding, padding);
+    ctx.restore();
   }
 
   private mapAzimuth(azimuth: number) {
