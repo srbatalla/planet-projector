@@ -11,8 +11,6 @@ type HorizonViewConfig = {
   sampleMinutes: number;
   startTime: Date;
   playbackSpeed: number;
-  horizonCutoff: number;
-  autoHorizon: boolean;
   trailFade: number;
   jumpSetting: number;
   trailPersistence: number;
@@ -605,22 +603,15 @@ export class HorizonView {
   }
 
   private isSampleVisible(sample: HorizonSample) {
-    const cutoff = this.getHorizonCutoffForAzimuth(sample.azimuth);
+    const cutoff = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
     return sample.altitude >= cutoff;
   }
 
   private isSampleDrawable(sample: HorizonSample) {
     // Allow drawing slightly below horizon - the horizon band will occlude it
-    const cutoff = this.getHorizonCutoffForAzimuth(sample.azimuth);
+    const cutoff = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
     const tolerance = 5; // degrees below horizon we'll still draw
     return sample.altitude >= cutoff - tolerance;
-  }
-
-  private getHorizonCutoffForAzimuth(azimuth: number) {
-    if (!this.config.autoHorizon) {
-      return this.config.horizonCutoff;
-    }
-    return this.getCurvedHorizonAltitudeAtAzimuth(azimuth);
   }
 
   private getCurvedHorizonAltitudeAtAzimuth(azimuth: number) {

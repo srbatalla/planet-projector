@@ -9,8 +9,6 @@ type ControlState = {
   sampleMinutes: number;
   playbackSpeed: number;
   startTime: Date;
-  horizonCutoff: number;
-  autoHorizon: boolean;
   trailFade: number;
   jumpSetting: number;
   trailPersistence: number;
@@ -33,29 +31,36 @@ const DEFAULTS: ControlState = {
   longitude: -122.4194,
   elevation: 0,
   sampleMinutes: 5,
-  playbackSpeed: 1000,
+  playbackSpeed: 10000,
   startTime: new Date(),
-  horizonCutoff: 0,
-  autoHorizon: true,
   trailFade: 0.2,
   jumpSetting: 1,
   trailPersistence: 20,
   cycleLimit: 8,
 };
 
+const SPEED_STEPS = [1, 1000, 5000, 10000, 20000, 50000, 100000, 500000];
+
 function sliderToSpeed(sliderValue: number): number {
-  // Base-10 log scale: slider 1-7 -> speeds 1x, 10x, 100x, 1k, 10k, 100k, 1M
-  // Formula: speed = 10^(slider-1)
-  const exponent = sliderValue - 1;
-  const speed = Math.pow(10, exponent);
-  return Math.max(1, Math.round(speed));
+  // Direct mapping: slider 1-8 -> [1, 1k, 5k, 10k, 20k, 50k, 100k, 500k]
+  const index = Math.max(0, Math.min(SPEED_STEPS.length - 1, sliderValue - 1));
+  return SPEED_STEPS[index];
 }
 
 function speedToSlider(speed: number): number {
-  // Inverse of sliderToSpeed
-  const exponent = Math.log10(Math.max(1, speed));
-  const slider = Math.round(exponent + 1);
-  return Math.max(1, Math.min(7, slider));
+  // Find closest speed step
+  let closestIndex = 0;
+  let closestDiff = Math.abs(speed - SPEED_STEPS[0]);
+
+  for (let i = 1; i < SPEED_STEPS.length; i++) {
+    const diff = Math.abs(speed - SPEED_STEPS[i]);
+    if (diff < closestDiff) {
+      closestDiff = diff;
+      closestIndex = i;
+    }
+  }
+
+  return closestIndex + 1;
 }
 
 function formatSpeedLabel(speed: number): string {
@@ -138,8 +143,6 @@ export function initializeApp() {
       sampleMinutes: state.sampleMinutes,
       startTime: state.startTime,
       playbackSpeed: state.playbackSpeed,
-      horizonCutoff: state.horizonCutoff,
-      autoHorizon: state.autoHorizon,
       trailFade: state.trailFade,
       jumpSetting: state.jumpSetting,
       trailPersistence: state.trailPersistence,
@@ -236,16 +239,8 @@ function createControls() {
     </label>
     <label class="slider">
       <span>Playback speed</span>
-      <input type="range" name="playbackSpeed" min="1" max="7" value="${speedToSlider(DEFAULTS.playbackSpeed)}" />
+      <input type="range" name="playbackSpeed" min="1" max="8" value="${speedToSlider(DEFAULTS.playbackSpeed)}" />
       <small data-speed-display>${formatSpeedLabel(DEFAULTS.playbackSpeed)}</small>
-    </label>
-    <label>
-      <span>Horizon cutoff (°)</span>
-      <input type="number" name="horizonCutoff" step="0.5" value="${DEFAULTS.horizonCutoff}" />
-    </label>
-    <label class="checkbox">
-      <input type="checkbox" name="autoHorizon" ${DEFAULTS.autoHorizon ? 'checked' : ''} />
-      <span>Auto horizon cutoff</span>
     </label>
     <label>
       <span>Trail fade rate</span>
@@ -296,8 +291,6 @@ function readControlState(root: HTMLElement): ControlState {
     elevation: getNumber('input[name="elevation"]', DEFAULTS.elevation),
     sampleMinutes: getNumber('input[name="sampleMinutes"]', DEFAULTS.sampleMinutes, 0.1),
     playbackSpeed,
-    autoHorizon: !!root.querySelector<HTMLInputElement>('input[name="autoHorizon"]')?.checked,
-    horizonCutoff: getNumber('input[name="horizonCutoff"]', DEFAULTS.horizonCutoff),
     trailFade: Math.min(1, Math.max(0, getNumber('input[name="trailFade"]', DEFAULTS.trailFade))),
     jumpSetting: Math.min(10, Math.max(1, Math.round(getNumber('input[name="jumpSetting"]', DEFAULTS.jumpSetting, 1)))),
     trailPersistence: Math.max(1, Math.round(getNumber('input[name="trailPersistence"]', DEFAULTS.trailPersistence, 1))),
