@@ -28,6 +28,13 @@ type SamplePoint = {
   altitude: number;
 };
 
+type VisibilityState = {
+  sample: HorizonSample;
+  timeMs: number;
+  horizonAlt: number;
+  visibilityValue: number;
+};
+
 const MAX_LOOKAHEAD_HOURS = 400;
 
 export class HorizonView {
@@ -187,9 +194,13 @@ export class HorizonView {
         return;
       }
 
+      // Warp to just before the next arc and seed drawing with the entry sample so the
+      // very first segment rises from beneath the horizon instead of popping in mid-air.
       this.simTimeMs = nextVisible.timeMs;
       this.remainderMs = 0;
-      this.currentSample = nextVisible.sample;
+      this.lastVisibleSample = nextVisible.sample;
+      this.lastVisibleTimeMs = nextVisible.timeMs;
+      this.currentSample = this.isSampleVisible(nextVisible.sample) ? nextVisible.sample : null;
       return;
     }
 
@@ -255,41 +266,59 @@ export class HorizonView {
   }
 
   private findArcEntryPoint(foundTimeMs: number): { sample: HorizonSample; timeMs: number } {
-    // Two-phase search: coarse then fine
-    // Phase 1: Coarse search backward with 30-minute steps
     const coarseStepMs = 30 * 60 * 1000;
-    let timeMs = foundTimeMs;
-    let lastDrawable: { sample: HorizonSample; timeMs: number } | null = null;
+    const maxCoarseSteps = Math.ceil((24 * 3600 * 1000) / coarseStepMs);
+    const backwardLimit = foundTimeMs - maxCoarseSteps * coarseStepMs;
+    const forwardLimit = foundTimeMs + maxCoarseSteps * coarseStepMs;
 
-    // Coarse search back up to 12 hours
-    const maxCoarseSteps = Math.ceil((12 * 3600 * 1000) / coarseStepMs);
-    for (let i = 0; i < maxCoarseSteps; i += 1) {
-      const sample = this.computeSampleAt(timeMs);
-      if (!this.isSampleDrawable(sample)) {
-        // Found boundary in coarse search - now refine
-        break;
+    let upperState = this.evaluateVisibilityState(foundTimeMs);
+    let lowerState = upperState;
+
+    if (upperState.visibilityValue >= 0) {
+      // Planet is currently above the curved horizon – walk backward until we dip below.
+      let bracketFound = false;
+      for (let i = 0; i < maxCoarseSteps && !bracketFound; i += 1) {
+        const candidateTime = upperState.timeMs - coarseStepMs;
+        if (candidateTime < backwardLimit) {
+          break;
+        }
+        const candidate = this.evaluateVisibilityState(candidateTime);
+        if (candidate.visibilityValue < 0) {
+          lowerState = candidate;
+          bracketFound = true;
+          break;
+        }
+        upperState = candidate;
       }
-      lastDrawable = { sample, timeMs };
-      timeMs -= coarseStepMs;
-    }
 
-    if (!lastDrawable) {
-      return { sample: this.computeSampleAt(foundTimeMs), timeMs: foundTimeMs };
-    }
+      if (!bracketFound) {
+        return { sample: upperState.sample, timeMs: upperState.timeMs };
+      }
+    } else {
+      // Already below horizon – walk forward until we find the first visible point to form a bracket.
+      let bracketFound = false;
+      for (let i = 0; i < maxCoarseSteps; i += 1) {
+        const candidateTime = lowerState.timeMs + coarseStepMs;
+        if (candidateTime > forwardLimit) {
+          break;
+        }
+        const candidate = this.evaluateVisibilityState(candidateTime);
+        if (candidate.visibilityValue >= 0) {
+          upperState = candidate;
+          bracketFound = true;
+          break;
+        }
+        lowerState = candidate;
+      }
 
-    // Phase 2: Fine search forward from last coarse position
-    const fineStepMs = Math.min(this.stepMs, 5 * 60 * 1000);
-    timeMs = lastDrawable.timeMs;
-    const endTimeMs = lastDrawable.timeMs + coarseStepMs;
-
-    for (; timeMs <= endTimeMs; timeMs += fineStepMs) {
-      const sample = this.computeSampleAt(timeMs);
-      if (this.isSampleDrawable(sample)) {
-        return { sample, timeMs };
+      if (!bracketFound) {
+        return { sample: lowerState.sample, timeMs: lowerState.timeMs };
       }
     }
 
-    return lastDrawable;
+    // Refine bracket to the precise crossing time so the entry point stays hidden beneath the horizon.
+    const entryState = this.refineHorizonCrossing(lowerState, upperState);
+    return { sample: entryState.sample, timeMs: entryState.timeMs };
   }
 
   private getJumpMilliseconds() {
@@ -552,6 +581,42 @@ export class HorizonView {
       return; // Avoid wrapping artifacts
     }
 
+    // Validate segment span to prevent "spawning mid-sky" effect
+    const altitudeDelta = Math.abs(b.altitude - a.altitude);
+    const aVisible = this.isSampleVisible(a);
+    const bVisible = this.isSampleVisible(b);
+
+    // If segment spans from below-horizon to far-above-horizon, subdivide it
+    // This happens at high playback speeds where samples jump large distances
+    if (!aVisible && bVisible && altitudeDelta > 8) {
+      // Subdivide into smaller segments to ensure smooth horizon crossing
+      const subdivisions = Math.ceil(altitudeDelta / 4); // ~4 degrees per subdivision
+      for (let i = 0; i < subdivisions; i++) {
+        const t1 = i / subdivisions;
+        const t2 = (i + 1) / subdivisions;
+
+        const intermediate1: HorizonSample = {
+          altitude: a.altitude + (b.altitude - a.altitude) * t1,
+          azimuth: a.azimuth + (b.azimuth - a.azimuth) * t1,
+          time: new Date(a.time.getTime() + (b.time.getTime() - a.time.getTime()) * t1)
+        };
+
+        const intermediate2: HorizonSample = {
+          altitude: a.altitude + (b.altitude - a.altitude) * t2,
+          azimuth: a.azimuth + (b.azimuth - a.azimuth) * t2,
+          time: new Date(a.time.getTime() + (b.time.getTime() - a.time.getTime()) * t2)
+        };
+
+        this.paintSingleSegment(intermediate1, intermediate2, layer);
+      }
+      return;
+    }
+
+    // Normal segment painting
+    this.paintSingleSegment(a, b, layer);
+  }
+
+  private paintSingleSegment(a: HorizonSample, b: HorizonSample, layer: TrailLayer) {
     const start = this.toCanvasPoint(a);
     const end = this.toCanvasPoint(b);
 
@@ -569,6 +634,45 @@ export class HorizonView {
     if (layer === this.activeTrail) {
       this.activeHasPaint = true;
     }
+  }
+
+  private evaluateVisibilityState(timeMs: number): VisibilityState {
+    const sample = this.computeSampleAt(timeMs);
+    const horizonAlt = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
+    return {
+      sample,
+      timeMs,
+      horizonAlt,
+      visibilityValue: sample.altitude - horizonAlt,
+    };
+  }
+
+  private refineHorizonCrossing(lowerState: VisibilityState, upperState: VisibilityState) {
+    let low = lowerState;
+    let high = upperState;
+    const resolutionMs = Math.min(this.stepMs, 60 * 1000);
+    const maxIterations = 12;
+
+    for (let i = 0; i < maxIterations && high.timeMs - low.timeMs > resolutionMs; i += 1) {
+      const midTimeMs = (low.timeMs + high.timeMs) / 2;
+      const midState = this.evaluateVisibilityState(midTimeMs);
+      if (midState.visibilityValue < 0) {
+        low = midState;
+      } else {
+        high = midState;
+      }
+    }
+
+    // Ensure returned state is still below the horizon.
+    if (low.visibilityValue >= 0) {
+      const nudgedTime = low.timeMs - resolutionMs / 4;
+      const nudgedState = this.evaluateVisibilityState(nudgedTime);
+      if (nudgedState.visibilityValue < 0) {
+        low = nudgedState;
+      }
+    }
+
+    return low;
   }
 
   private commitActiveTrailToHistory() {
