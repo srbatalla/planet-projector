@@ -68,7 +68,8 @@ body {
 
   .controls {
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  flex: 1 1 auto;
+    flex: 1 1 auto;
+  }
 }
 
 .controls label.checkbox {
@@ -78,6 +79,11 @@ body {
   gap: 8px;
   text-transform: none;
   letter-spacing: 0.02em;
+}
+
+.controls label.checkbox.disabled {
+  opacity: 0.35;
+  pointer-events: none;
 }
 
 .controls label.checkbox input {
@@ -94,6 +100,44 @@ body {
   font-size: 0.7rem;
   color: #d0d0d0;
 }
+
+.controls label.select select {
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 6px 8px;
+  border: 1px solid #222;
+  border-radius: 4px;
+  background: #050505;
+  color: #f8f8f2;
+}
+
+.controls fieldset.planet-picker {
+  border: 1px solid #222;
+  border-radius: 6px;
+  margin: 0;
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #b0b0b0;
+}
+
+.controls fieldset.planet-picker legend {
+  padding: 0 6px;
+  margin: 0;
+  font-size: 0.75rem;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+}
+
+.controls .planet-checkboxes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 4px 12px;
 }
 
 .panel {
@@ -110,4 +154,30 @@ body {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: #bcbcbc;
+}
+
+.view-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.view-tabs button {
+  flex: 0 0 auto;
+  border: 1px solid #222;
+  background: #0f0f0f;
+  color: #bcbcbc;
+  padding: 6px 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.7rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border 0.2s ease;
+}
+
+.view-tabs button.active {
+  background: #f8f8f2;
+  color: #050505;
+  border-color: #f8f8f2;
 }
