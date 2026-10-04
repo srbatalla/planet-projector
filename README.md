@@ -29,13 +29,16 @@ npm run build      # type-check + production build into dist/
 
 ## Deploy
 
-It is a static site. On Cloudflare Pages (or any static host):
+It is a static site, deployed on Cloudflare as a static-assets Worker (`wrangler.jsonc`), with the
+GitHub repo connected so every push to `main` redeploys:
 
 | Setting | Value |
 |---|---|
 | Build command | `npm run build` |
-| Output directory | `dist` |
-| Node version | 18+ (`NODE_VERSION` env var) |
+| Deploy command | `npx wrangler deploy` (serves `dist/`, per `wrangler.jsonc`) |
+| Node version | 22 (`.node-version`; current Wrangler requires it) |
+
+Cloudflare Pages or any other static host works too: build with `npm run build` and publish `dist/`.
 
 No redirects are needed: all state lives in the URL fragment. HTTPS is required for
 "Use my location" and the native share sheet.

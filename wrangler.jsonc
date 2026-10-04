@@ -1,0 +1,9 @@
+// Cloudflare Workers deploy: a static-assets-only Worker serving the Vite build.
+// `npm run build` writes dist/; `npx wrangler deploy` uploads it (dist/_headers applies).
+{
+  "name": "planet-projector",
+  "compatibility_date": "2025-10-01",
+  "assets": {
+    "directory": "./dist"
+  }
+}
