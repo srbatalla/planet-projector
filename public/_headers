@@ -1,0 +1,6 @@
+# Cloudflare Pages: the service worker must always be revalidated so updates reach installed apps;
+# hashed build assets never change.
+/sw.js
+  Cache-Control: no-cache
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable

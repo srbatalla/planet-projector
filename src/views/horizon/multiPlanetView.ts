@@ -1,10 +1,43 @@
-import { Body, Observer } from 'astronomy-engine';
+import { Body, Illumination, Observer } from 'astronomy-engine';
 import { computeHorizonPoint, type HorizonSample } from '../../core/astro';
-import { CanvasSurface } from '../../render/canvas';
+import { CanvasSurface, createLayerCanvas, observeResize } from '../../render/canvas';
+import { drawMarkerLabel, LabelLayout, MARKER_LABEL_FONT } from '../../render/labels';
 import { PlanetRenderer } from './planetRenderer';
+import { createProjection, type Point, type ProjectionKind, type SkyProjection } from './projection';
+import { moonlightStrength, NIGHT_SKY, skyColors, starVisibility } from './sky';
+import { StarField, type StarMode } from './starField';
+import { CloudLayer, type CloudMode } from './cloudLayer';
+import { MilkyWayLayer } from './milkyWay';
+import {
+  DEFAULT_MARKER_RADIUS,
+  drawMoonDisc,
+  drawSunGlow,
+  MOON_MARKER_RADIUS,
+  radiusForMagnitude,
+  stepToward,
+  SUN_MARKER_RADIUS,
+  usesMagnitude,
+} from './markers';
+import type { TrailStyle } from './trailPath';
+import { MAX_EPOCH_MS, type ViewStatus } from '../viewStatus';
+import type { SkyTarget } from '../targets';
+
+export type HorizonVisuals = {
+  projection: ProjectionKind;
+  stars: StarMode;
+  skyTint: boolean;
+  lineWidth: number;
+  trailStyle: TrailStyle;
+  /** Brightness trails keep once their fresh glow fades (with a sweep fade rate). */
+  settledBrightness: number;
+  labels: boolean;
+  clouds: CloudMode;
+  cloudCover: number;
+  milkyWay: boolean;
+};
 
 type MultiPlanetViewConfig = {
-  bodies: Body[];
+  targets: SkyTarget[];
   observer: Observer;
   sampleMinutes: number;
   startTime: Date;
@@ -14,16 +47,7 @@ type MultiPlanetViewConfig = {
   cycleLimit: number;
   activeFadeRate: number;
   azimuthCheckpointInterval: number;
-};
-
-type AltitudeRange = {
-  min: number;
-  max: number;
-};
-
-type SamplePoint = {
-  azimuth: number;
-  altitude: number;
+  visuals: HorizonVisuals;
 };
 
 type VisibilityState = {
@@ -36,7 +60,6 @@ type VisibilityState = {
 type VisiblePlanetSample = {
   renderer: PlanetRenderer;
   previewSample: HorizonSample;
-  markerSample: HorizonSample;
 };
 
 type PendingEntry = {
@@ -45,150 +68,174 @@ type PendingEntry = {
 };
 
 const MAX_LOOKAHEAD_HOURS = 400;
+/** Longer frames (background tab, debugger) are clamped so we never simulate a burst of steps. */
+const MAX_FRAME_DELTA_MS = 100;
+/**
+ * Main-thread budget for simulation steps per frame. Past it the leftover time is dropped:
+ * slow devices see a slower sky instead of a feedback loop of ever-longer frames.
+ */
+const STEP_BUDGET_MS = 8;
+/** …and never more than this share of the measured frame interval (120 Hz displays get ~4 ms). */
+const STEP_BUDGET_FRAME_SHARE = 0.5;
 
 export class MultiPlanetView {
   private surface: CanvasSurface;
   private animationHandle: number | null = null;
   private lastFrameTime: number | null = null;
-  private readonly altitudeRange: AltitudeRange = { min: -10, max: 90 };
   private readonly stepMs: number;
   private readonly baseTimestamp: number;
-
-  // Pre-calculated constants for performance
-  private readonly AZIMUTH_TO_NORMALIZED = 1 / 360;
 
   // Simulation state
   private simTimeMs = 0;
   private remainderMs = 0;
   private jumpSetting: number;
+  private paused = false;
+  private started = false;
 
   // Planet renderers - one per enabled body
   private planetRenderers: PlanetRenderer[] = [];
 
-  // Shared resources
-  private historyCanvasPool: HTMLCanvasElement[] = [];
-  private staticLayerSize = { width: 0, height: 0 };
-  private gridLayer: HTMLCanvasElement | null = null;
-  private horizonLayer: HTMLCanvasElement | null = null;
+  // Projection, static layers and the shared history composite
+  private projection: SkyProjection;
+  private groundLayer: HTMLCanvasElement | null = null;
+  /** Displayed history composite, and the one being rebuilt a body at a time. */
+  private historyLayer: HTMLCanvasElement | null = null;
+  private backLayer: HTMLCanvasElement | null = null;
+  private backCtx: CanvasRenderingContext2D | null = null;
+  private readonly flushCtx = createLayerCanvas(1, 1).getContext('2d');
+  private historyLayerDirty = true;
+  private historyHasContent = false;
+  private backHasContent = false;
+  private rebuildQueue: PlanetRenderer[] = [];
+  private rebuildCursor = -1;
+  private lastHistoryRebuildAt = -Infinity;
+  private historyRebuildCostMs = 0;
+  private readonly starField: StarField;
+  private readonly cloudLayer: CloudLayer;
+  private readonly milkyWay: MilkyWayLayer;
+  private moonPhase = 0;
+  private moonPhaseAtMs = Number.NaN;
+  private readonly markerSun = { azimuth: 0, altitude: -90, atMs: Number.NaN };
+  private readonly markerStep = { azimuth: 0, altitude: 0 };
+  /** Planet marker radii from apparent magnitude, refreshed for one body per frame. */
+  private readonly markerRadii = new Map<PlanetRenderer, { radius: number; atMs: number }>();
+  private markerRefreshCursor = 0;
+  private readonly labelLayout = new LabelLayout();
+  private lastSimDeltaMs = 0;
+  private readonly sunObserverDate = new Date();
+
   private completedPassRenderers = new Set<PlanetRenderer>();
+  private finishedRenderers = new Set<PlanetRenderer>();
   private pendingEntryTargets = new Map<PlanetRenderer, PendingEntry>();
   private pendingJumpSetting: number | null = null;
   private spawnWithoutHistory = new Set<PlanetRenderer>();
-  private readonly canvasPoolManager = {
-    acquire: () => this.acquireHistoryCanvas(),
-    release: (canvas: HTMLCanvasElement) => this.releaseHistoryCanvas(canvas),
-  };
-  private readonly mappingFunctions = {
-    mapAzimuth: (az: number) => this.mapAzimuth(az),
-    mapAltitude: (alt: number) => this.mapAltitude(alt),
-    getCurvedHorizonAltitudeAtAzimuth: (az: number) => this.getCurvedHorizonAltitudeAtAzimuth(az),
-    isSampleVisible: (sample: HorizonSample) => this.isSampleVisible(sample),
-    isSampleDrawable: (sample: HorizonSample) => this.isSampleDrawable(sample),
-    toCanvasPoint: (point: SamplePoint) => this.toCanvasPoint(point),
-  };
   private simulationFrozen = false;
+  private readonly point: Point = { x: 0, y: 0 };
+  private readonly isVisible = (sample: HorizonSample) => this.isSampleVisible(sample);
 
-  // Cached dimensions
-  private cachedLogicalWidth = 0;
-  private cachedLogicalHeight = 0;
-
-  // FPS tracking
-  private fpsFrameTimes: number[] = [];
-  private fps = 0;
+  // Frame statistics (exponential moving averages)
+  private frameIntervalEma = 16.7;
+  private frameWorkEma = 0;
   private lastFrameDurationMs = 16;
-  private resizeListenerAttached = false;
+  private lastVisible: VisiblePlanetSample[] = [];
+  private disconnectResize: (() => void) | null = null;
 
   constructor(private container: HTMLElement, private config: MultiPlanetViewConfig) {
     this.stepMs = Math.max(1, this.config.sampleMinutes * 60 * 1000);
     this.baseTimestamp = this.config.startTime.getTime();
     this.jumpSetting = this.config.jumpSetting;
 
-    // Create canvas
     const canvas = document.createElement('canvas');
-    canvas.style.display = 'block';
-    canvas.style.width = '100%';
-    canvas.style.height = '100%';
     this.container.appendChild(canvas);
-
     this.surface = new CanvasSurface(canvas);
 
-    // Update dimension cache
-    this.updateDimensionCache();
+    this.projection = createProjection(config.visuals.projection);
+    this.projection.setSize(this.surface.width, this.surface.height);
+    this.starField = new StarField(
+      config.visuals.stars,
+      config.observer.latitude,
+      config.observer.longitude
+    );
+    // Seeded by the start minute: the same run always has the same weather.
+    this.cloudLayer = new CloudLayer(
+      config.visuals.clouds,
+      config.visuals.cloudCover,
+      Math.floor(this.baseTimestamp / 60000)
+    );
+    this.cloudLayer.resize(this.projection, this.surface.width, this.surface.height, this.surface.pixelRatio);
+    this.starField.setOcclusion((x, y) => this.cloudLayer.densityAt(x, y));
+    this.milkyWay = new MilkyWayLayer(config.visuals.milkyWay, config.observer.latitude, config.observer.longitude);
+    this.milkyWay.resize(this.projection, this.surface.width, this.surface.height, this.surface.pixelRatio);
 
-    // Create renderer for each planet
     this.createPlanetRenderers();
     this.simulationFrozen = this.planetRenderers.length === 0;
+    this.rebuildStaticLayers();
+  }
 
-    // Initialize static layers
-    this.ensureStaticLayers();
+  get canvas() {
+    return this.surface.canvas;
   }
 
   private createPlanetRenderers() {
-    for (const body of this.config.bodies) {
-      const renderer = this.createRendererForBody(body);
-      this.planetRenderers.push(renderer);
+    for (const target of this.config.targets) {
+      this.planetRenderers.push(this.createRenderer(target));
     }
   }
 
-  private createRendererForBody(body: Body) {
-    const renderer = new PlanetRenderer(
+  private createRenderer(target: SkyTarget) {
+    return new PlanetRenderer(
       {
-        body,
+        target,
         observer: this.config.observer,
         baseTimestamp: this.baseTimestamp,
-        stepMs: this.stepMs,
         trailPersistence: this.config.trailPersistence,
         azimuthCheckpointInterval: this.config.azimuthCheckpointInterval,
         activeFadeRate: this.config.activeFadeRate,
         cycleLimit: this.config.cycleLimit,
+        lineWidth: this.config.visuals.lineWidth,
+        trailStyle: this.config.visuals.trailStyle,
+        settledBrightness: this.config.visuals.settledBrightness,
       },
-      this.mappingFunctions,
-      this.canvasPoolManager
+      this.isVisible
     );
-
-    renderer.syncTrailCanvas(this.surface.canvas, this.surface.pixelRatio);
-    return renderer;
   }
 
   private destroyRenderer(renderer: PlanetRenderer) {
     renderer.reset();
     this.spawnWithoutHistory.delete(renderer);
+    this.finishedRenderers.delete(renderer);
+    this.historyLayerDirty = true;
   }
 
   start() {
-    if (this.animationHandle !== null) {
+    if (this.started) {
       return;
     }
+    this.started = true;
+    this.disconnectResize = observeResize(this.container, this.handleResize);
 
-    if (this.planetRenderers.length === 0) {
-      return;
+    if (this.planetRenderers.length > 0) {
+      this.seedInitialEntries();
     }
+    this.scheduleFrame();
+  }
 
-    if (!this.resizeListenerAttached) {
-      window.addEventListener('resize', this.handleResize, { passive: true });
-      this.resizeListenerAttached = true;
-    }
-
+  private seedInitialEntries() {
     // Initialize: find the earliest upcoming visible arc among all planets
     let earliestEntryTime: number | null = null;
     const entryPoints = new Map<PlanetRenderer, PendingEntry>();
 
     for (const renderer of this.planetRenderers) {
       const initialSample = renderer.computeSampleAt(this.simTimeMs);
-      let entryPoint: { sample: HorizonSample; timeMs: number } | null = null;
-
-      if (this.isSampleDrawable(initialSample)) {
-        entryPoint = this.findArcEntryPoint(renderer, this.simTimeMs);
-      } else {
-        entryPoint = this.seekNextVisibleSample(renderer, this.simTimeMs, 0);
-      }
+      const entryPoint = this.isSampleDrawable(initialSample)
+        ? this.findArcEntryPoint(renderer, this.simTimeMs)
+        : this.seekNextVisibleSample(renderer, this.simTimeMs, 0);
 
       if (entryPoint) {
         entryPoints.set(renderer, entryPoint);
-      }
-
-      if (entryPoint && (earliestEntryTime === null || entryPoint.timeMs < earliestEntryTime)) {
-        earliestEntryTime = entryPoint.timeMs;
+        if (earliestEntryTime === null || this.isEarlierInPlay(entryPoint.timeMs, earliestEntryTime)) {
+          earliestEntryTime = entryPoint.timeMs;
+        }
       }
     }
 
@@ -197,8 +244,6 @@ export class MultiPlanetView {
       this.remainderMs = 0;
       this.syncRenderersToEntryPoints(entryPoints, earliestEntryTime);
     }
-
-    this.animationHandle = requestAnimationFrame(this.loop);
   }
 
   stop() {
@@ -206,15 +251,100 @@ export class MultiPlanetView {
       cancelAnimationFrame(this.animationHandle);
       this.animationHandle = null;
     }
+    this.disconnectResize?.();
+    this.disconnectResize = null;
+    this.started = false;
+  }
 
-    if (this.resizeListenerAttached) {
-      window.removeEventListener('resize', this.handleResize);
-      this.resizeListenerAttached = false;
+  setPaused(paused: boolean) {
+    if (paused === this.paused) {
+      return;
+    }
+    this.paused = paused;
+    if (paused) {
+      if (this.animationHandle !== null) {
+        cancelAnimationFrame(this.animationHandle);
+        this.animationHandle = null;
+      }
+    } else {
+      this.lastFrameTime = null;
+      this.scheduleFrame();
     }
   }
 
+  private scheduleFrame() {
+    if (this.animationHandle === null && this.started && !this.paused) {
+      this.animationHandle = requestAnimationFrame(this.loop);
+    }
+  }
+
+  /** +1 forward, −1 rewinding (negative playback speed). */
+  private get direction() {
+    return this.config.playbackSpeed < 0 ? -1 : 1;
+  }
+
+  /** Sim time shown this frame: the last step plus progress toward the next, in play direction. */
+  private get previewTimeMs() {
+    return this.simTimeMs + this.direction * this.remainderMs;
+  }
+
   updatePlaybackSpeed(newSpeed: number) {
-    this.config.playbackSpeed = Math.max(1, newSpeed);
+    const previousDirection = this.direction;
+    const magnitude = Math.max(1, Math.abs(newSpeed));
+    this.config.playbackSpeed = newSpeed < 0 ? -magnitude : magnitude;
+    if (this.direction !== previousDirection) {
+      this.reverseDirection();
+    }
+  }
+
+  /**
+   * Time changed direction. Bodies on screen keep drawing (their trail now grows back along
+   * where they came from); bodies waiting for their next arc re-seek it in the new direction.
+   * Skip-ahead only runs forward, so sweep tracking starts afresh.
+   */
+  private reverseDirection() {
+    this.remainderMs = 0;
+    this.pendingEntryTargets.clear();
+    this.completedPassRenderers.clear();
+    this.spawnWithoutHistory.clear();
+    for (const renderer of this.planetRenderers) {
+      if (!this.finishedRenderers.has(renderer) && !renderer.getLastVisibleSample()) {
+        this.initializeRendererEntry(renderer);
+      }
+    }
+    this.starField.markJump();
+  }
+
+  /** True when `a` comes before `b` in the current playback direction. */
+  private isEarlierInPlay(a: number, b: number) {
+    return this.direction > 0 ? a < b : a > b;
+  }
+
+  updateVisuals(visuals: HorizonVisuals) {
+    const previous = this.config.visuals;
+    this.config.visuals = visuals;
+    if (visuals.projection !== previous.projection) {
+      this.projection = createProjection(visuals.projection);
+      this.projection.setSize(this.surface.width, this.surface.height);
+      this.rebuildStaticLayers();
+      this.starField.invalidate();
+      this.cloudLayer.resize(this.projection, this.surface.width, this.surface.height, this.surface.pixelRatio);
+      this.milkyWay.resize(this.projection, this.surface.width, this.surface.height, this.surface.pixelRatio);
+    }
+    this.starField.setMode(visuals.stars);
+    this.cloudLayer.setMode(visuals.clouds, visuals.cloudCover);
+    this.milkyWay.setEnabled(visuals.milkyWay);
+    if (
+      visuals.lineWidth !== previous.lineWidth ||
+      visuals.trailStyle !== previous.trailStyle ||
+      visuals.settledBrightness !== previous.settledBrightness
+    ) {
+      for (const renderer of this.planetRenderers) {
+        renderer.setStyle(visuals.lineWidth, visuals.trailStyle, visuals.settledBrightness);
+      }
+    }
+    this.historyLayerDirty = true;
+    this.renderStill();
   }
 
   updateJumpSetting(newSetting: number) {
@@ -250,66 +380,84 @@ export class MultiPlanetView {
     }
   }
 
-  updatePlanets(newBodies: Body[]) {
-    const uniqueBodies = Array.from(new Set(newBodies));
+  /** Add/remove planets and special objects live; existing trails are kept for retained targets. */
+  updateTargets(newTargets: SkyTarget[]) {
+    const uniqueTargets = newTargets.filter(
+      (target, index) => newTargets.findIndex((other) => other.id === target.id) === index
+    );
     const previousCount = this.planetRenderers.length;
-    this.config.bodies = uniqueBodies;
+    this.config.targets = uniqueTargets;
 
-    const existingMap = new Map<Body, PlanetRenderer>();
+    const existingMap = new Map<string, PlanetRenderer>();
     for (const renderer of this.planetRenderers) {
-      existingMap.set(renderer.body, renderer);
+      existingMap.set(renderer.target.id, renderer);
     }
 
     const retained = new Set<PlanetRenderer>();
     const newRenderers: PlanetRenderer[] = [];
     const additions: PlanetRenderer[] = [];
 
-    for (const body of uniqueBodies) {
-      const renderer = existingMap.get(body);
+    for (const target of uniqueTargets) {
+      const renderer = existingMap.get(target.id);
       if (renderer) {
         newRenderers.push(renderer);
         retained.add(renderer);
       } else {
-        const created = this.createRendererForBody(body);
+        const created = this.createRenderer(target);
         newRenderers.push(created);
         additions.push(created);
       }
     }
 
-    const removed: PlanetRenderer[] = [];
     for (const renderer of this.planetRenderers) {
       if (!retained.has(renderer)) {
-        removed.push(renderer);
+        this.destroyRenderer(renderer);
+        this.completedPassRenderers.delete(renderer);
+        this.pendingEntryTargets.delete(renderer);
       }
     }
 
-    for (const renderer of removed) {
-      this.destroyRenderer(renderer);
-      this.completedPassRenderers.delete(renderer);
-      this.pendingEntryTargets.delete(renderer);
-    }
-
     this.planetRenderers = newRenderers;
-    const hasPlanets = this.planetRenderers.length > 0;
+    this.markerRadii.clear();
 
-    if (!hasPlanets) {
+    if (this.planetRenderers.length === 0) {
       this.simulationFrozen = true;
       this.pendingEntryTargets.clear();
       this.completedPassRenderers.clear();
       this.spawnWithoutHistory.clear();
+      this.renderStill();
       return;
     }
 
-    const previouslyEmpty = previousCount === 0;
-    if (previouslyEmpty) {
+    if (previousCount === 0) {
       this.simulationFrozen = false;
       this.reseedAfterPlanetActivation();
+      this.renderStill();
       return;
     }
 
     for (const renderer of additions) {
       this.initializeRendererEntry(renderer);
     }
+    this.simulationFrozen = this.finishedRenderers.size >= this.planetRenderers.length;
+    this.renderStill();
+  }
+
+  getStatus(): ViewStatus {
+    const timeMs = this.baseTimestamp + this.previewTimeMs;
+    const visible = this.lastVisible.map((entry) => entry.renderer.target.id);
+    const finished = this.planetRenderers.length > 0 && this.finishedRenderers.size >= this.planetRenderers.length;
+    return {
+      timeMs,
+      elapsedMs: timeMs - this.baseTimestamp,
+      targets: this.config.targets.map(({ id, label, color }) => ({ id, label, color })),
+      visible,
+      waiting: !finished && visible.length === 0 && this.jumpSetting !== 1 && this.planetRenderers.length > 0,
+      finished,
+      fps: this.frameIntervalEma > 0 ? 1000 / this.frameIntervalEma : 0,
+      frameWorkMs: this.frameWorkEma,
+      paused: this.paused,
+    };
   }
 
   private initializeRendererEntry(renderer: PlanetRenderer) {
@@ -342,7 +490,7 @@ export class MultiPlanetView {
       }
 
       entryPoints.set(renderer, entryPoint);
-      if (earliestEntryTime === null || entryPoint.timeMs < earliestEntryTime) {
+      if (earliestEntryTime === null || this.isEarlierInPlay(entryPoint.timeMs, earliestEntryTime)) {
         earliestEntryTime = entryPoint.timeMs;
       }
     }
@@ -357,6 +505,7 @@ export class MultiPlanetView {
     this.simTimeMs = earliestEntryTime;
     this.remainderMs = 0;
     this.syncRenderersToEntryPoints(entryPoints, earliestEntryTime);
+    this.starField.markJump();
   }
 
   private findNextFutureEntryPoint(renderer: PlanetRenderer, fromTimeMs: number) {
@@ -368,59 +517,80 @@ export class MultiPlanetView {
       if (!this.isSampleDrawable(sample)) {
         break;
       }
-      searchTime += this.stepMs;
+      searchTime += this.direction * this.stepMs;
     }
 
     return this.seekNextVisibleSample(renderer, searchTime, 0);
   }
 
   private loop = (timestamp: number) => {
+    this.animationHandle = null;
+    const workStart = performance.now();
     if (this.lastFrameTime === null) {
       this.lastFrameTime = timestamp;
     }
 
-    const deltaTime = timestamp - this.lastFrameTime;
+    const rawDelta = timestamp - this.lastFrameTime;
     this.lastFrameTime = timestamp;
+    if (rawDelta > 0) {
+      this.frameIntervalEma += (Math.min(rawDelta, 1000) - this.frameIntervalEma) * 0.05;
+    }
+    const deltaTime = Math.min(rawDelta, MAX_FRAME_DELTA_MS);
     this.lastFrameDurationMs = deltaTime;
 
-    // Update FPS
-    this.updateFPS(deltaTime);
-
-    const deltaSimMs = deltaTime * this.config.playbackSpeed;
-    this.advanceSimulation(deltaSimMs);
-    this.render(deltaTime, deltaSimMs);
-    this.animationHandle = requestAnimationFrame(this.loop);
+    this.lastSimDeltaMs = deltaTime * this.config.playbackSpeed;
+    this.advanceSimulation(this.lastSimDeltaMs);
+    this.render();
+    this.frameWorkEma += (performance.now() - workStart - this.frameWorkEma) * 0.05;
+    this.scheduleFrame();
   };
 
   private advanceSimulation(deltaSimMs: number) {
-    if (deltaSimMs <= 0 || this.simulationFrozen || this.planetRenderers.length === 0) {
+    if (deltaSimMs === 0 || this.simulationFrozen || this.planetRenderers.length === 0) {
       return;
     }
 
-    this.remainderMs += deltaSimMs;
+    // remainderMs is progress toward the next step in the current direction (always ≥ 0).
+    this.remainderMs += Math.abs(deltaSimMs);
     const stepsToProcess = Math.floor(this.remainderMs / this.stepMs);
-    for (let i = 0; i < stepsToProcess; i += 1) {
+    const budgetEnd =
+      performance.now() + Math.min(STEP_BUDGET_MS, this.frameIntervalEma * STEP_BUDGET_FRAME_SHARE);
+    for (let i = 0; i < stepsToProcess && !this.simulationFrozen; i += 1) {
       this.remainderMs -= this.stepMs;
       this.processStep(this.stepMs);
+      if ((i & 3) === 3 && performance.now() > budgetEnd) {
+        this.remainderMs = Math.min(this.remainderMs, this.stepMs * 0.999);
+        break;
+      }
+    }
+    if (this.simulationFrozen) {
+      this.remainderMs = 0;
     }
   }
 
   private processStep(stepMs: number) {
-    this.simTimeMs += stepMs;
+    const direction = this.direction;
+    if (Math.abs(this.baseTimestamp + this.simTimeMs + direction * stepMs) > MAX_EPOCH_MS) {
+      this.simulationFrozen = true;
+      return;
+    }
+    this.simTimeMs += direction * stepMs;
 
-    // Process each planet independently
-    let anyPlanetDrawable = false;
-    const jumpEnabled = this.jumpSetting !== 1;
+    // Skip-ahead is forward-only: rewinding just plays every arc back continuously.
+    const jumpEnabled = this.jumpSetting !== 1 && direction > 0;
     const trackingSweeps = jumpEnabled || this.pendingJumpSetting !== null;
 
     for (const renderer of this.planetRenderers) {
+      if (this.finishedRenderers.has(renderer)) {
+        continue;
+      }
       if (trackingSweeps && this.completedPassRenderers.has(renderer)) {
         continue;
       }
 
       const pendingEntry = this.pendingEntryTargets.get(renderer);
       if (pendingEntry) {
-        if (this.simTimeMs < pendingEntry.timeMs) {
+        if (this.isEarlierInPlay(this.simTimeMs, pendingEntry.timeMs)) {
           continue;
         }
         renderer.setLastVisibleSample(pendingEntry.sample, pendingEntry.timeMs);
@@ -429,13 +599,11 @@ export class MultiPlanetView {
       }
 
       const sample = renderer.computeSampleAt(this.simTimeMs);
-      const isDrawable = this.isSampleDrawable(sample);
 
-      if (!isDrawable) {
-        // Planet not drawable - mark for potential jump
-        const lastSample = renderer.getLastVisibleSample();
-        if (lastSample) {
-          renderer.commitActiveTrailToHistory();
+      if (!this.isSampleDrawable(sample)) {
+        // Planet set: retire this sweep into history and wait for the next rise.
+        if (renderer.getLastVisibleSample()) {
+          this.commitRenderer(renderer);
           renderer.setLastVisibleSample(null);
           if (trackingSweeps) {
             this.completedPassRenderers.add(renderer);
@@ -444,10 +612,8 @@ export class MultiPlanetView {
         continue;
       }
 
-      anyPlanetDrawable = true;
-
-      // Planet is drawable - paint segment
       let lastSample = renderer.getLastVisibleSample();
+      let lastTimeMs = renderer.getLastVisibleTimeMs();
       if (!lastSample) {
         if (this.spawnWithoutHistory.has(renderer)) {
           this.spawnWithoutHistory.delete(renderer);
@@ -459,17 +625,31 @@ export class MultiPlanetView {
         const entryPoint = this.findArcEntryPoint(renderer, this.simTimeMs);
         renderer.setLastVisibleSample(entryPoint.sample, entryPoint.timeMs);
         lastSample = entryPoint.sample;
+        lastTimeMs = entryPoint.timeMs;
       }
 
-      if (lastSample) {
-        renderer.paintSegment(lastSample, sample);
-      }
-
+      renderer.paintSegment(lastSample, lastTimeMs, sample, this.simTimeMs);
       renderer.setLastVisibleSample(sample, this.simTimeMs);
+
+      if (renderer.hasCompletedFullTurn()) {
+        this.commitRenderer(renderer);
+      }
     }
 
-    const sweepComplete =
-      trackingSweeps && this.completedPassRenderers.size === this.planetRenderers.length;
+    if (this.finishedRenderers.size >= this.planetRenderers.length) {
+      this.simulationFrozen = true;
+      return;
+    }
+
+    let sweepComplete = trackingSweeps;
+    if (sweepComplete) {
+      for (const renderer of this.planetRenderers) {
+        if (!this.completedPassRenderers.has(renderer) && !this.finishedRenderers.has(renderer)) {
+          sweepComplete = false;
+          break;
+        }
+      }
+    }
 
     if (sweepComplete) {
       const appliedSetting = this.applyPendingJumpSetting();
@@ -486,6 +666,14 @@ export class MultiPlanetView {
     }
   }
 
+  private commitRenderer(renderer: PlanetRenderer) {
+    renderer.commitActiveTrailToHistory(this.simTimeMs);
+    if (renderer.hasReachedCycleLimit()) {
+      this.finishedRenderers.add(renderer);
+      renderer.setLastVisibleSample(null);
+    }
+  }
+
   private performCoordinatedJump() {
     const jumpMs = this.getJumpMilliseconds();
     let earliestCrossingTime: number | null = null;
@@ -493,15 +681,15 @@ export class MultiPlanetView {
 
     // Find the earliest horizon crossing among all planets
     for (const renderer of this.planetRenderers) {
+      if (this.finishedRenderers.has(renderer)) {
+        continue;
+      }
       const crossingInfo = this.seekNextVisibleSample(renderer, this.simTimeMs, jumpMs);
-
       if (crossingInfo) {
         crossingInfos.set(renderer, crossingInfo);
-        if (earliestCrossingTime === null || crossingInfo.timeMs < earliestCrossingTime) {
+        if (earliestCrossingTime === null || this.isEarlierInPlay(crossingInfo.timeMs, earliestCrossingTime)) {
           earliestCrossingTime = crossingInfo.timeMs;
         }
-      } else {
-        crossingInfos.delete(renderer);
       }
     }
 
@@ -514,6 +702,7 @@ export class MultiPlanetView {
     this.simTimeMs = earliestCrossingTime;
     this.remainderMs = 0;
     this.syncRenderersToEntryPoints(crossingInfos, earliestCrossingTime);
+    this.starField.markJump();
   }
 
   private syncRenderersToEntryPoints(
@@ -560,7 +749,8 @@ export class MultiPlanetView {
       (MAX_LOOKAHEAD_HOURS * 3600 * 1000) / Math.max(1, this.stepMs)
     );
 
-    let timeMs = fromTimeMs + jumpMs;
+    const direction = this.direction;
+    let timeMs = fromTimeMs + direction * jumpMs;
     for (let i = 0; i < maxIterations; i += 1) {
       const sample = renderer.computeSampleAt(timeMs);
       if (this.isSampleDrawable(sample)) {
@@ -568,7 +758,7 @@ export class MultiPlanetView {
       }
 
       // Adaptive stepping
-      const cutoff = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
+      const cutoff = this.projection.cutoffAltitude(sample.azimuth);
       const depthBelowHorizon = cutoff - sample.altitude;
       let adaptiveStep = this.stepMs;
 
@@ -580,7 +770,7 @@ export class MultiPlanetView {
         adaptiveStep = 30 * 60 * 1000;
       }
 
-      timeMs += adaptiveStep;
+      timeMs += direction * adaptiveStep;
     }
 
     return null;
@@ -590,10 +780,11 @@ export class MultiPlanetView {
     renderer: PlanetRenderer,
     foundTimeMs: number
   ): { sample: HorizonSample; timeMs: number } {
-    const coarseStepMs = 30 * 60 * 1000;
-    const maxCoarseSteps = Math.ceil((24 * 3600 * 1000) / coarseStepMs);
-    const backwardLimit = foundTimeMs - maxCoarseSteps * coarseStepMs;
-    const forwardLimit = foundTimeMs + maxCoarseSteps * coarseStepMs;
+    // "Entry" is where the arc begins in play order: before the found time when playing
+    // forward (the rise), after it when rewinding (the set).
+    const coarseStepMs = 30 * 60 * 1000 * this.direction;
+    const maxCoarseSteps = Math.ceil((24 * 3600 * 1000) / Math.abs(coarseStepMs));
+    const searchSpan = maxCoarseSteps * Math.abs(coarseStepMs);
 
     let upperState = this.evaluateVisibilityState(renderer, foundTimeMs);
     let lowerState = upperState;
@@ -602,7 +793,7 @@ export class MultiPlanetView {
       let bracketFound = false;
       for (let i = 0; i < maxCoarseSteps && !bracketFound; i += 1) {
         const candidateTime = upperState.timeMs - coarseStepMs;
-        if (candidateTime < backwardLimit) break;
+        if (Math.abs(candidateTime - foundTimeMs) > searchSpan) break;
 
         const candidate = this.evaluateVisibilityState(renderer, candidateTime);
         if (candidate.visibilityValue < 0) {
@@ -620,7 +811,7 @@ export class MultiPlanetView {
       let bracketFound = false;
       for (let i = 0; i < maxCoarseSteps; i += 1) {
         const candidateTime = lowerState.timeMs + coarseStepMs;
-        if (candidateTime > forwardLimit) break;
+        if (Math.abs(candidateTime - foundTimeMs) > searchSpan) break;
 
         const candidate = this.evaluateVisibilityState(renderer, candidateTime);
         if (candidate.visibilityValue >= 0) {
@@ -642,7 +833,7 @@ export class MultiPlanetView {
 
   private evaluateVisibilityState(renderer: PlanetRenderer, timeMs: number): VisibilityState {
     const sample = renderer.computeSampleAt(timeMs);
-    const horizonAlt = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
+    const horizonAlt = this.projection.cutoffAltitude(sample.azimuth);
     return {
       sample,
       timeMs,
@@ -661,7 +852,8 @@ export class MultiPlanetView {
     const resolutionMs = Math.min(this.stepMs, 60 * 1000);
     const maxIterations = 12;
 
-    for (let i = 0; i < maxIterations && high.timeMs - low.timeMs > resolutionMs; i += 1) {
+    // `low` is the not-yet-visible side, `high` the visible one; they may be in either time order.
+    for (let i = 0; i < maxIterations && Math.abs(high.timeMs - low.timeMs) > resolutionMs; i += 1) {
       const midTimeMs = (low.timeMs + high.timeMs) / 2;
       const midState = this.evaluateVisibilityState(renderer, midTimeMs);
       if (midState.visibilityValue < 0) {
@@ -672,7 +864,8 @@ export class MultiPlanetView {
     }
 
     if (low.visibilityValue >= 0) {
-      const nudgedTime = low.timeMs - resolutionMs / 4;
+      const awayFromVisible = Math.sign(low.timeMs - high.timeMs) || -1;
+      const nudgedTime = low.timeMs + (awayFromVisible * resolutionMs) / 4;
       const nudgedState = this.evaluateVisibilityState(renderer, nudgedTime);
       if (nudgedState.visibilityValue < 0) {
         low = nudgedState;
@@ -698,525 +891,615 @@ export class MultiPlanetView {
     return months * 30 * 24 * 3600 * 1000;
   }
 
-  private render(deltaTime: number, deltaSimMs: number) {
-    // Fade and age all planet trails
-    for (const renderer of this.planetRenderers) {
-      renderer.fadeTrailLayer(deltaSimMs);
-
-      const currentSample = renderer.computeSampleAt(this.simTimeMs + this.remainderMs);
-      if (this.isSampleVisible(currentSample)) {
-        renderer.ageHistoryLayersByAzimuth(currentSample);
-      }
-
-      renderer.incrementHistoryLayerCycles(this.lastFrameDurationMs);
+  /** Redraw without advancing time (paused edits, resizes). */
+  private renderStill() {
+    if (this.paused && this.started) {
+      this.render();
     }
-
-    this.surface.clear();
-    const visiblePlanets = this.collectVisiblePlanetSamples();
-    this.blitStaticLayer(this.gridLayer, 'grid');
-
-    // Draw all planet history layers
-    for (const renderer of this.planetRenderers) {
-      renderer.drawHistoryLayers(
-        this.surface.context,
-        this.cachedLogicalWidth,
-        this.cachedLogicalHeight
-      );
-    }
-
-    // Draw all planet active trails
-    for (const renderer of this.planetRenderers) {
-      renderer.drawActiveTrail(
-        this.surface.context,
-        this.cachedLogicalWidth,
-        this.cachedLogicalHeight
-      );
-    }
-
-    // Draw preview segments so slow sample intervals still look fluid
-    this.drawPreviewSegments(visiblePlanets);
-
-    // Draw glow halos and markers beneath the horizon
-    this.drawMarkerGlows(visiblePlanets);
-    this.drawMarkerCores(visiblePlanets);
-
-    this.blitStaticLayer(this.horizonLayer, 'horizon');
-    this.drawAxesLabels(this.cachedLogicalWidth);
-    this.drawInfo(visiblePlanets);
-    this.drawFPS();
   }
 
-  private collectVisiblePlanetSamples(): VisiblePlanetSample[] {
+  private render() {
+    const previewTime = this.previewTimeMs;
+    for (const renderer of this.planetRenderers) {
+      if (!this.paused) {
+        renderer.update(this.lastFrameDurationMs);
+      }
+      if (renderer.historyDirty) {
+        this.historyLayerDirty = true;
+      }
+    }
+
+    const ctx = this.surface.context;
+    const width = this.surface.width;
+    const height = this.surface.height;
+    const absoluteTime = this.baseTimestamp + previewTime;
+    const sun = this.computeSun(absoluteTime);
+    const sunAltitude = sun.altitude;
+    const moon = this.computeMoon(absoluteTime);
+    const visuals = this.config.visuals;
+
+    // Every full-canvas raster op counts on phones: the sky fill replaces the clear, and the
+    // grid is a handful of hairlines drawn directly rather than another full-screen blit.
+    if (visuals.skyTint) {
+      const colors = skyColors(sunAltitude, moon.light);
+      this.projection.fillSky(ctx, colors.zenith, colors.horizon);
+      this.drawMoonGlow(ctx, this.projection, moon, sunAltitude);
+    } else {
+      this.surface.clear(NIGHT_SKY.zenith);
+    }
+
+    this.projection.drawGrid(ctx);
+    // Clouds repaint their buffer now (drawn later, over the trails) so the Milky Way can skip
+    // repainting in the same frame: two full-sky repaints at once is a visible hitch on phones.
+    let cloudsRepainted = false;
+    if (this.cloudLayer.enabled) {
+      cloudsRepainted = this.cloudLayer.update(
+        this.paused ? 0 : this.lastFrameDurationMs,
+        this.paused ? 0 : this.lastSimDeltaMs,
+        this.cloudLight(sun, moon),
+        this.paused
+      );
+    }
+    // The Milky Way needs real darkness: it fades with twilight and drowns in moonlight.
+    if (visuals.milkyWay) {
+      const darkness = visuals.skyTint ? starVisibility(sunAltitude) * (1 - 0.85 * moon.light) : 1;
+      this.milkyWay.update(
+        this.paused ? 0 : this.lastFrameDurationMs,
+        absoluteTime,
+        darkness,
+        this.paused,
+        !cloudsRepainted
+      );
+      this.milkyWay.draw(ctx, this.surface.width, this.surface.height);
+    }
+    this.starField.draw(
+      ctx,
+      this.projection,
+      absoluteTime,
+      visuals.skyTint ? starVisibility(sunAltitude, moon.light) : 1,
+      this.surface.canvas.width,
+      this.surface.canvas.height,
+      this.surface.pixelRatio
+    );
+    this.drawSkyMoon(ctx, this.projection, moon, absoluteTime);
+
+    this.advanceHistoryRebuild();
+    if (this.historyHasContent) {
+      this.blitLayer(this.historyLayer);
+    }
+    for (const renderer of this.planetRenderers) {
+      renderer.drawLiveHistory(ctx, this.projection, previewTime);
+    }
+
+    for (const renderer of this.planetRenderers) {
+      renderer.drawActive(ctx, this.projection, previewTime);
+    }
+
+    // Clouds veil the trails beneath them; markers and labels stay on top.
+    if (this.cloudLayer.enabled) {
+      this.cloudLayer.draw(ctx, this.surface.width, this.surface.height);
+    }
+
+    const visiblePlanets = this.collectVisiblePlanetSamples(previewTime);
+    this.lastVisible = visiblePlanets;
+    this.refreshMarkerRadii(absoluteTime);
+    this.drawPreviewSegments(visiblePlanets);
+    this.drawMarkers(visiblePlanets);
+    this.blitGround();
+    this.drawMarkerLabels(visiblePlanets);
+  }
+
+  /**
+   * Render the current moment into a new canvas of any logical size (e.g. a phone-shaped
+   * portrait for snapshots) without disturbing the live view: vectors are re-projected and the
+   * star-trail bitmap is carried over through the projections' affine relation.
+   */
+  renderSnapshot(width: number, height: number, into?: HTMLCanvasElement): HTMLCanvasElement {
+    const ratio = this.surface.pixelRatio;
+    // `into` lets a recording redraw the same frame canvas every animation frame.
+    const canvas = into ?? createLayerCanvas(Math.round(width * ratio), Math.round(height * ratio));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return canvas;
+    }
+    ctx.setTransform(canvas.width / width, 0, 0, canvas.height / height, 0, 0);
+    const projection = createProjection(this.config.visuals.projection);
+    projection.setSize(width, height);
+    const previewTime = this.previewTimeMs;
+    const absoluteTime = this.baseTimestamp + previewTime;
+    const visuals = this.config.visuals;
+    const sunAltitude = this.computeSunAltitude(absoluteTime);
+    const moon = this.computeMoon(absoluteTime);
+
+    if (visuals.skyTint) {
+      const colors = skyColors(sunAltitude, moon.light);
+      projection.fillSky(ctx, colors.zenith, colors.horizon);
+      this.drawMoonGlow(ctx, projection, moon, sunAltitude);
+    } else {
+      ctx.fillStyle = NIGHT_SKY.zenith;
+      ctx.fillRect(0, 0, width + 1, height + 1);
+    }
+    projection.drawGrid(ctx);
+    this.milkyWay.drawSnapshot(ctx, projection, this.projection, this.surface.width, this.surface.height);
+    this.starField.drawSnapshot(
+      ctx,
+      projection,
+      this.projection,
+      visuals.skyTint ? starVisibility(sunAltitude, moon.light) : 1,
+      this.surface.width,
+      this.surface.height
+    );
+    this.drawSkyMoon(ctx, projection, moon, absoluteTime);
+    for (const renderer of this.planetRenderers) {
+      renderer.drawSnapshot(ctx, projection, previewTime);
+    }
+    this.cloudLayer.drawSnapshot(ctx, projection, this.projection, this.surface.width, this.surface.height);
+    const visiblePlanets = this.lastVisible;
+    this.drawPreviewSegments(visiblePlanets, ctx, projection);
+    this.drawMarkers(visiblePlanets, ctx, projection);
+    projection.drawGround(ctx);
+    this.drawMarkerLabels(visiblePlanets, ctx, projection, width);
+    return canvas;
+  }
+
+  /** Only the band that can contain ground pixels is composited (the panorama's bottom strip). */
+  private blitGround() {
+    const layer = this.groundLayer;
+    if (!layer) {
+      return;
+    }
+    const ratio = this.surface.pixelRatio;
+    const top = Math.max(0, Math.floor(this.projection.groundTop()));
+    const height = this.surface.height - top;
+    if (height <= 0) {
+      return;
+    }
+    this.surface.context.drawImage(
+      layer,
+      0, top * ratio, layer.width, Math.min(layer.height - top * ratio, height * ratio),
+      0, top, this.surface.width, height
+    );
+  }
+
+  private computeSunAltitude(absoluteTimeMs: number) {
+    return this.computeSun(absoluteTimeMs).altitude;
+  }
+
+  /** The Sun's position when something needs it (sky tint, cloud lighting); otherwise "night". */
+  private computeSun(absoluteTimeMs: number) {
+    const visuals = this.config.visuals;
+    if (!visuals.skyTint && visuals.clouds === 'off') {
+      return { altitude: -90, azimuth: 0 };
+    }
+    this.sunObserverDate.setTime(absoluteTimeMs);
+    const sample = computeHorizonPoint({ body: Body.Sun, observer: this.config.observer, time: this.sunObserverDate });
+    return { altitude: sample.altitude, azimuth: sample.azimuth };
+  }
+
+  /**
+   * The Moon's position and light, when the sky or clouds use it. Its phase changes slowly, so
+   * it is recomputed only once per simulated hour.
+   */
+  private computeMoon(absoluteTimeMs: number) {
+    const visuals = this.config.visuals;
+    if (!visuals.skyTint && visuals.clouds === 'off') {
+      return { altitude: -90, azimuth: 0, phase: 0, light: 0 };
+    }
+    this.sunObserverDate.setTime(absoluteTimeMs);
+    const sample = computeHorizonPoint({ body: Body.Moon, observer: this.config.observer, time: this.sunObserverDate });
+    const phase = this.moonPhaseAt(absoluteTimeMs);
+    return {
+      altitude: sample.altitude,
+      azimuth: sample.azimuth,
+      phase,
+      light: moonlightStrength(sample.altitude, phase),
+    };
+  }
+
+  /** Illuminated fraction of the Moon; it changes slowly, so it is cached per simulated hour. */
+  private moonPhaseAt(absoluteTimeMs: number) {
+    if (!(Math.abs(absoluteTimeMs - this.moonPhaseAtMs) < 3600000)) {
+      this.sunObserverDate.setTime(absoluteTimeMs);
+      this.moonPhase = Illumination(Body.Moon, this.sunObserverDate).phase_fraction;
+      this.moonPhaseAtMs = absoluteTimeMs;
+    }
+    return this.moonPhase;
+  }
+
+  /**
+   * Keep magnitude-based marker sizes current: missing entries are filled at once, then one stale
+   * body (over 6 simulated hours old) is refreshed per frame so fast playback never stalls.
+   */
+  private refreshMarkerRadii(absoluteTimeMs: number) {
+    const renderers = this.planetRenderers;
+    const count = renderers.length;
+    let refreshed = false;
+    for (let k = 0; k < count; k += 1) {
+      const index = (this.markerRefreshCursor + k) % count;
+      const renderer = renderers[index];
+      const body = renderer.target.body;
+      if (!usesMagnitude(body)) {
+        continue;
+      }
+      const entry = this.markerRadii.get(renderer);
+      const stale = !entry || Math.abs(absoluteTimeMs - entry.atMs) > 6 * 3600000;
+      if (!stale || (entry && refreshed)) {
+        continue;
+      }
+      this.sunObserverDate.setTime(absoluteTimeMs);
+      const radius = radiusForMagnitude(Illumination(body, this.sunObserverDate).mag);
+      this.markerRadii.set(renderer, { radius, atMs: absoluteTimeMs });
+      if (entry) {
+        refreshed = true;
+        this.markerRefreshCursor = (index + 1) % count;
+      }
+    }
+  }
+
+  private markerRadius(renderer: PlanetRenderer) {
+    const body = renderer.target.body;
+    if (body === Body.Sun) {
+      return SUN_MARKER_RADIUS;
+    }
+    if (body === Body.Moon) {
+      return MOON_MARKER_RADIUS;
+    }
+    return this.markerRadii.get(renderer)?.radius ?? DEFAULT_MARKER_RADIUS;
+  }
+
+  /** The Moon's disc with its lit limb turned toward the Sun. */
+  private drawMoonShape(
+    ctx: CanvasRenderingContext2D,
+    projection: SkyProjection,
+    moon: { azimuth: number; altitude: number },
+    radius: number,
+    color: string,
+    absoluteTimeMs: number
+  ) {
+    const p = this.point;
+    projection.project(moon.azimuth, moon.altitude, p);
+    const x = p.x;
+    const y = p.y;
+    const toward = stepToward(moon, this.markerSunAt(absoluteTimeMs), 2, this.markerStep);
+    projection.project(toward.azimuth, toward.altitude, p);
+    drawMoonDisc(ctx, x, y, radius, this.moonPhaseAt(absoluteTimeMs), Math.atan2(p.y - y, p.x - x), color);
+  }
+
+  /**
+   * The Moon as part of the sky when its light is in play (sky tint or clouds) but it is not a
+   * traced body: drawn before the clouds so they can veil it, with a small bloom.
+   */
+  private drawSkyMoon(
+    ctx: CanvasRenderingContext2D,
+    projection: SkyProjection,
+    moon: { azimuth: number; altitude: number; phase: number },
+    absoluteTimeMs: number
+  ) {
+    if (moon.altitude < -0.5 || this.planetRenderers.some((renderer) => renderer.target.body === Body.Moon)) {
+      return;
+    }
+    const p = this.point;
+    projection.project(moon.azimuth, moon.altitude, p);
+    const radius = MOON_MARKER_RADIUS - 1;
+    const bloom = ctx.createRadialGradient(p.x, p.y, radius * 0.8, p.x, p.y, radius * 4);
+    bloom.addColorStop(0, `rgba(226, 232, 244, ${0.35 * moon.phase})`);
+    bloom.addColorStop(1, 'rgba(226, 232, 244, 0)');
+    ctx.save();
+    ctx.fillStyle = bloom;
+    ctx.fillRect(p.x - radius * 4, p.y - radius * 4, radius * 8, radius * 8);
+    this.drawMoonShape(ctx, projection, moon, radius, '#e9edf3', absoluteTimeMs);
+    ctx.restore();
+  }
+
+  /** The Sun's direction for the Moon's lit limb; it barely moves in 10 simulated minutes. */
+  private markerSunAt(absoluteTimeMs: number) {
+    const sun = this.markerSun;
+    if (!(Math.abs(absoluteTimeMs - sun.atMs) < 600000)) {
+      this.sunObserverDate.setTime(absoluteTimeMs);
+      const sample = computeHorizonPoint({ body: Body.Sun, observer: this.config.observer, time: this.sunObserverDate });
+      sun.azimuth = sample.azimuth;
+      sun.altitude = sample.altitude;
+      sun.atMs = absoluteTimeMs;
+    }
+    return sun;
+  }
+
+  /** Soft bloom of sky light around a bright Moon (night only, with the daylight-sky tint). */
+  private drawMoonGlow(
+    ctx: CanvasRenderingContext2D,
+    projection: SkyProjection,
+    moon: { altitude: number; azimuth: number; light: number },
+    sunAltitude: number
+  ) {
+    const strength = moon.light * (1 - Math.min(1, Math.max(0, (sunAltitude + 10) / 8)));
+    if (strength < 0.02) {
+      return;
+    }
+    const p = this.point;
+    projection.project(moon.azimuth, moon.altitude, p);
+    const radius = Math.max(60, Math.min(this.surface.width, this.surface.height) * 0.22);
+    const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius);
+    // A bright aureole close in (scattering is strongly forward) over a wide faint skirt.
+    glow.addColorStop(0, `rgba(214, 224, 244, ${0.42 * strength})`);
+    glow.addColorStop(0.07, `rgba(200, 214, 240, ${0.24 * strength})`);
+    glow.addColorStop(0.3, `rgba(160, 180, 220, ${0.09 * strength})`);
+    glow.addColorStop(1, 'rgba(120, 140, 190, 0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(p.x - radius, p.y - radius, radius * 2, radius * 2);
+  }
+
+  private cloudLight(
+    sun: { altitude: number; azimuth: number },
+    moon: { altitude: number; azimuth: number; phase: number }
+  ) {
+    return {
+      sunAzimuth: sun.azimuth,
+      sunAltitude: sun.altitude,
+      moonAzimuth: moon.azimuth,
+      moonAltitude: moon.altitude,
+      moonPhase: moon.phase,
+    };
+  }
+
+  private collectVisiblePlanetSamples(previewTime: number): VisiblePlanetSample[] {
     const visible: VisiblePlanetSample[] = [];
-    const previewTime = this.simTimeMs + this.remainderMs;
     const trackingSweeps = this.jumpSetting !== 1 || this.pendingJumpSetting !== null;
 
     for (const renderer of this.planetRenderers) {
       if (
         (trackingSweeps && this.completedPassRenderers.has(renderer)) ||
-        this.pendingEntryTargets.has(renderer)
+        this.pendingEntryTargets.has(renderer) ||
+        this.finishedRenderers.has(renderer)
       ) {
         continue;
       }
 
       const previewSample = renderer.computeSampleAt(previewTime);
-      if (!this.isSampleVisible(previewSample)) {
-        continue;
+      if (this.isSampleVisible(previewSample)) {
+        visible.push({ renderer, previewSample });
       }
-
-      const lastSample = renderer.getLastVisibleSample();
-      const markerSample = this.isSampleVisible(previewSample)
-        ? previewSample
-        : lastSample ?? previewSample;
-
-      visible.push({
-        renderer,
-        previewSample,
-        markerSample,
-      });
     }
 
     return visible;
   }
 
-  private drawMarkerGlows(visiblePlanets: VisiblePlanetSample[]) {
-    const ctx = this.surface.context;
+  private drawMarkers(
+    visiblePlanets: VisiblePlanetSample[],
+    ctx: CanvasRenderingContext2D = this.surface.context,
+    projection: SkyProjection = this.projection
+  ) {
+    const p = this.point;
     ctx.save();
 
-    for (const { renderer, markerSample } of visiblePlanets) {
-      const x = this.mapAzimuth(markerSample.azimuth);
-      const y = this.mapAltitude(markerSample.altitude);
-      const color = renderer.color;
-
-      // Draw o-scope style glow (outer halo)
-      ctx.fillStyle = color;
+    // Oscilloscope-style halo first so cores always sit on top of neighbouring glows.
+    for (const { renderer, previewSample } of visiblePlanets) {
+      projection.project(previewSample.azimuth, previewSample.altitude, p);
+      const radius = this.markerRadius(renderer);
+      if (renderer.target.body === Body.Sun) {
+        drawSunGlow(ctx, p.x, p.y, radius);
+        continue;
+      }
+      // The Moon's disc carries its own shape; a tighter halo keeps the phase readable.
+      const reach = renderer.target.body === Body.Moon ? 1.5 : 2;
+      ctx.fillStyle = renderer.color;
       ctx.globalAlpha = 0.15;
       ctx.beginPath();
-      ctx.arc(x, y, 8, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, radius * reach, 0, Math.PI * 2);
       ctx.fill();
-
-      // Draw medium glow
       ctx.globalAlpha = 0.3;
-      ctx.beginPath();
-      ctx.arc(x, y, 8, 0, Math.PI * 2);
       ctx.fill();
-
-      // Draw brighter inner glow
       ctx.globalAlpha = 0.5;
       ctx.beginPath();
-      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, radius * 1.5, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    ctx.restore();
-  }
-
-  private drawMarkerCores(visiblePlanets: VisiblePlanetSample[]) {
-    const ctx = this.surface.context;
-    ctx.save();
-
-    for (const { renderer, markerSample } of visiblePlanets) {
-      const x = this.mapAzimuth(markerSample.azimuth);
-      const y = this.mapAltitude(markerSample.altitude);
-
-      // Draw main planet marker (sharp and bright)
+    ctx.globalAlpha = 1;
+    for (const { renderer, previewSample } of visiblePlanets) {
+      projection.project(previewSample.azimuth, previewSample.altitude, p);
+      const radius = this.markerRadius(renderer);
+      if (renderer.target.body === Body.Moon) {
+        this.drawMoonShape(ctx, projection, previewSample, radius, renderer.color, this.baseTimestamp + this.previewTimeMs);
+        continue;
+      }
       ctx.fillStyle = renderer.color;
       ctx.beginPath();
-      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
       ctx.fill();
+      if (renderer.target.body === Body.Sun) {
+        ctx.fillStyle = 'rgba(255, 252, 235, 0.9)';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, radius * 0.55, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     ctx.restore();
   }
 
-  private drawPreviewSegments(visiblePlanets: VisiblePlanetSample[]) {
-    const ctx = this.surface.context;
+  /** Drawn after the ground so names of bodies near the horizon stay readable. */
+  private drawMarkerLabels(
+    visiblePlanets: VisiblePlanetSample[],
+    ctx: CanvasRenderingContext2D = this.surface.context,
+    projection: SkyProjection = this.projection,
+    width = this.surface.width
+  ) {
+    if (!this.config.visuals.labels || visiblePlanets.length === 0) {
+      return;
+    }
+    const p = this.point;
+    const layout = this.labelLayout;
+    layout.reset();
+    for (const { renderer, previewSample } of visiblePlanets) {
+      projection.project(previewSample.azimuth, previewSample.altitude, p);
+      layout.addMarker(p.x, p.y, this.markerRadius(renderer) + 1);
+    }
+    ctx.save();
+    ctx.font = MARKER_LABEL_FONT;
+    ctx.globalAlpha = 0.85;
+    for (const { renderer, previewSample } of visiblePlanets) {
+      projection.project(previewSample.azimuth, previewSample.altitude, p);
+      const gap = Math.max(9, this.markerRadius(renderer) + 4);
+      drawMarkerLabel(ctx, renderer.target.label, renderer.color, p.x, p.y, width, gap, layout);
+    }
+    ctx.restore();
+  }
+
+  private drawPreviewSegments(
+    visiblePlanets: VisiblePlanetSample[],
+    ctx: CanvasRenderingContext2D = this.surface.context,
+    projection: SkyProjection = this.projection
+  ) {
+    const p = this.point;
     ctx.save();
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
+    ctx.lineWidth = this.config.visuals.lineWidth;
+    ctx.globalAlpha = 0.9;
     for (const { renderer, previewSample } of visiblePlanets) {
       const anchor = renderer.getLastVisibleSample();
       if (!anchor) {
         continue;
       }
-      const startX = this.mapAzimuth(anchor.azimuth);
-      const startY = this.mapAltitude(anchor.altitude);
-      const endX = this.mapAzimuth(previewSample.azimuth);
-      const endY = this.mapAltitude(previewSample.altitude);
-      if (!Number.isFinite(startX + startY + endX + endY)) {
+      if (projection.wrapsAzimuth && Math.abs(anchor.azimuth - previewSample.azimuth) > 180) {
         continue;
       }
-
+      projection.project(anchor.azimuth, anchor.altitude, p);
+      const startX = p.x;
+      const startY = p.y;
+      projection.project(previewSample.azimuth, previewSample.altitude, p);
       ctx.strokeStyle = renderer.color;
-      ctx.lineWidth = 2;
-      ctx.globalAlpha = 0.9;
       ctx.beginPath();
       ctx.moveTo(startX, startY);
-      ctx.lineTo(endX, endY);
+      ctx.lineTo(p.x, p.y);
       ctx.stroke();
     }
     ctx.restore();
-  }
-
-
-  private drawInfo(visiblePlanets: VisiblePlanetSample[]) {
-    const ctx = this.surface.context;
-
-    ctx.save();
-    ctx.font = '12px "JetBrains Mono", "Fira Code", monospace';
-    const padding = 12;
-    const textY = padding + 12;
-
-    let label: string;
-    if (this.config.bodies.length === 0) {
-      label = 'No planets selected · Simulation paused';
-    } else if (visiblePlanets.length > 0) {
-      const firstSample = visiblePlanets[0].previewSample;
-      const elapsed = this.formatElapsedTime(firstSample.time);
-      const planetList = visiblePlanets.map((p) => p.renderer.body).join(', ');
-      label = [
-        `Visible: ${planetList}`,
-        `Observer: ${this.formatObserver(this.config.observer)}`,
-        `Start (UTC): ${this.config.startTime.toISOString().slice(0, 16)}`,
-        `Frame (UTC): ${firstSample.time.toISOString().slice(0, 19)}`,
-        `Elapsed: ${elapsed}`,
-      ].join('  ·  ');
-    } else if (this.jumpSetting === 1) {
-      const currentTime = new Date(this.baseTimestamp + this.simTimeMs + this.remainderMs);
-      const elapsed = this.formatElapsedTime(currentTime);
-      label = [
-        `Planets: ${this.config.bodies.join(', ')}`,
-        `Observer: ${this.formatObserver(this.config.observer)}`,
-        `Start (UTC): ${this.config.startTime.toISOString().slice(0, 16)}`,
-        `Frame (UTC): ${currentTime.toISOString().slice(0, 19)}`,
-        `Elapsed: ${elapsed}`,
-      ].join('  ·  ');
-    } else {
-      label = [
-        `Planets: ${this.config.bodies.join(', ')}`,
-        `Observer: ${this.formatObserver(this.config.observer)}`,
-        `Start (UTC): ${this.config.startTime.toISOString().slice(0, 16)}`,
-        'Waiting for next visible arc...',
-      ].join('  ·  ');
-    }
-
-    ctx.fillStyle = '#cfcfcf';
-    ctx.fillText(label, padding, textY);
-    ctx.restore();
-  }
-
-  private drawAxesLabels(width: number) {
-    const ctx = this.surface.context;
-    ctx.save();
-    ctx.fillStyle = '#8a8a8a';
-    ctx.font = '10px "JetBrains Mono", "Fira Code", monospace';
-
-    const azLabels = ['0°', '90°', '180°', '270°'];
-    for (let i = 0; i < azLabels.length; i++) {
-      const x = this.mapAzimuth(i * 90);
-      ctx.fillText(azLabels[i], x + 4, 12);
-    }
-
-    for (let alt = this.altitudeRange.min; alt <= this.altitudeRange.max; alt += 30) {
-      const y = this.mapAltitude(alt);
-      ctx.fillText(`${alt}°`, width - 36, y - 4);
-    }
-
-    ctx.restore();
-  }
-
-  private formatObserver(observer: Observer) {
-    const latLabel = `${Math.abs(observer.latitude).toFixed(2)}°${observer.latitude >= 0 ? 'N' : 'S'}`;
-    const lonLabel = `${Math.abs(observer.longitude).toFixed(2)}°${observer.longitude >= 0 ? 'E' : 'W'}`;
-    return `${latLabel} ${lonLabel}`;
-  }
-
-  private formatElapsedTime(frameTime: Date) {
-    const elapsedMs = frameTime.getTime() - this.config.startTime.getTime();
-    const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
-    const days = Math.floor(totalSeconds / 86400);
-    const hours = Math.floor((totalSeconds % 86400) / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-    const parts = [];
-    if (days > 0) {
-      parts.push(`${days}d`);
-    }
-    parts.push(`${hours.toString().padStart(2, '0')}h`);
-    parts.push(`${minutes.toString().padStart(2, '0')}m`);
-    parts.push(`${seconds.toString().padStart(2, '0')}s`);
-    return parts.join(' ');
-  }
-
-  private updateFPS(deltaTime: number) {
-    this.fpsFrameTimes.push(deltaTime);
-    if (this.fpsFrameTimes.length > 60) {
-      this.fpsFrameTimes.shift();
-    }
-
-    if (this.fpsFrameTimes.length > 0) {
-      const avgDelta = this.fpsFrameTimes.reduce((a, b) => a + b, 0) / this.fpsFrameTimes.length;
-      this.fps = avgDelta > 0 ? Math.round(1000 / avgDelta) : 0;
-    }
-  }
-
-  private drawFPS() {
-    const ctx = this.surface.context;
-    ctx.save();
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 16px "JetBrains Mono", "Fira Code", monospace';
-    ctx.textAlign = 'right';
-    ctx.textBaseline = 'top';
-    const padding = 12;
-    const text = `${this.fps} FPS`;
-    ctx.fillText(text, this.cachedLogicalWidth - padding, padding);
-    ctx.restore();
-  }
-
-  // Coordinate mapping functions
-  private mapAzimuth(azimuth: number) {
-    return azimuth * this.AZIMUTH_TO_NORMALIZED * this.cachedLogicalWidth;
-  }
-
-  private mapAltitude(altitude: number) {
-    const { min, max } = this.altitudeRange;
-    const clamped = Math.max(min, Math.min(max, altitude));
-    const height = this.cachedLogicalHeight;
-    const paddingTop = this.getTopPaddingPx();
-    if (height <= 0) {
-      return 0;
-    }
-
-    const usableHeight = Math.max(1, height - paddingTop);
-    const ratio = (clamped - min) / (max - min || 1);
-    return paddingTop + usableHeight * (1 - ratio);
-  }
-
-  private toCanvasPoint(point: SamplePoint): { x: number; y: number } {
-    return {
-      x: this.mapAzimuth(point.azimuth),
-      y: this.mapAltitude(point.altitude),
-    };
-  }
-
-  private getCurvedHorizonY(x: number) {
-    const width = this.cachedLogicalWidth;
-    const base = this.mapAltitude(0);
-    if (width <= 0) return base;
-
-    const amplitude = Math.min(20, this.cachedLogicalHeight * 0.03);
-    const normalized = x / width;
-    return base - Math.sin(normalized * Math.PI) * amplitude;
-  }
-
-  private unmapAltitude(y: number) {
-    const height = this.cachedLogicalHeight;
-    const { min, max } = this.altitudeRange;
-    if (height <= 0) return min;
-
-    const paddingTop = this.getTopPaddingPx();
-    const usableHeight = Math.max(1, height - paddingTop);
-    const clampedY = Math.max(paddingTop, Math.min(height, y));
-    const ratio = 1 - (clampedY - paddingTop) / usableHeight;
-    return ratio * (max - min) + min;
-  }
-
-  private getTopPaddingPx() {
-    const height = this.cachedLogicalHeight;
-    if (height <= 0) {
-      return 0;
-    }
-    return Math.max(24, height * 0.04);
-  }
-
-  private getCurvedHorizonAltitudeAtAzimuth(azimuth: number) {
-    const x = this.mapAzimuth(azimuth);
-    const y = this.getCurvedHorizonY(x);
-    // Offset by 8 logical pixels to match visual horizon offset
-    return this.unmapAltitude(y + 8);
   }
 
   private isSampleVisible(sample: HorizonSample) {
-    const cutoff = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
-    return sample.altitude >= cutoff;
+    return sample.altitude >= this.projection.cutoffAltitude(sample.azimuth);
   }
 
   private isSampleDrawable(sample: HorizonSample) {
-    const cutoff = this.getCurvedHorizonAltitudeAtAzimuth(sample.azimuth);
     const tolerance = 5;
-    return sample.altitude >= cutoff - tolerance;
+    return sample.altitude >= this.projection.cutoffAltitude(sample.azimuth) - tolerance;
   }
 
-  // Canvas pool management
-  private acquireHistoryCanvas(): HTMLCanvasElement {
-    const canvas = this.historyCanvasPool.pop() ?? document.createElement('canvas');
-    const targetWidth = this.surface.canvas.width;
-    const targetHeight = this.surface.canvas.height;
+  private createLogicalLayer() {
+    const layer = createLayerCanvas(this.surface.canvas.width, this.surface.canvas.height);
+    const ctx = layer.getContext('2d');
+    ctx?.setTransform(this.surface.pixelRatio, 0, 0, this.surface.pixelRatio, 0, 0);
+    return { layer, ctx };
+  }
 
-    if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
-      canvas.width = targetWidth;
-      canvas.height = targetHeight;
-      canvas.style.width = this.surface.canvas.style.width;
-      canvas.style.height = this.surface.canvas.style.height;
+  private rebuildStaticLayers() {
+    const ground = this.createLogicalLayer();
+    if (ground.ctx) {
+      this.projection.drawGround(ground.ctx);
+    }
+    this.groundLayer = ground.layer;
+    this.historyLayer = null;
+    this.historyHasContent = false;
+    this.backLayer = null;
+    this.backCtx = null;
+    this.rebuildQueue = [];
+    this.rebuildCursor = -1;
+    this.historyLayerDirty = true;
+    for (const renderer of this.planetRenderers) {
+      renderer.resetCompositeState();
+    }
+  }
+
+  /**
+   * Rebuild the history composite into a back buffer one body at a time (each slice is forced
+   * to rasterise immediately), then swap. Rebuilds are rate-limited to ~20% of frame time, so
+   * dense, fast skies never stall a frame; sweeps not yet composited are drawn directly.
+   */
+  private advanceHistoryRebuild() {
+    const now = performance.now();
+    // While paused nothing else will finish a stale rebuild: restart it from the current state.
+    if (this.paused && this.rebuildCursor >= 0 && this.historyLayerDirty) {
+      this.rebuildCursor = -1;
+    }
+    if (this.rebuildCursor < 0) {
+      if (!this.historyLayerDirty) {
+        return;
+      }
+      const minInterval = Math.min(250, this.historyRebuildCostMs * 5);
+      if (this.historyLayer && !this.paused && now - this.lastHistoryRebuildAt < minInterval) {
+        return;
+      }
+      if (!this.backLayer || !this.backCtx) {
+        const { layer, ctx } = this.createLogicalLayer();
+        this.backLayer = layer;
+        this.backCtx = ctx;
+      }
+      if (!this.backCtx) {
+        return;
+      }
+      this.backCtx.save();
+      this.backCtx.setTransform(1, 0, 0, 1, 0, 0);
+      this.backCtx.clearRect(0, 0, this.backLayer.width, this.backLayer.height);
+      this.backCtx.restore();
+      this.rebuildQueue = this.planetRenderers.slice();
+      this.backHasContent = false;
+      for (const renderer of this.rebuildQueue) {
+        renderer.historyDirty = false;
+      }
+      this.historyLayerDirty = false;
+      this.rebuildCursor = 0;
+      this.lastHistoryRebuildAt = now;
+      this.historyRebuildCostMs = 0;
     }
 
-    return canvas;
-  }
-
-  private releaseHistoryCanvas(canvas: HTMLCanvasElement) {
-    this.historyCanvasPool.push(canvas);
-  }
-
-  // Static layer management
-  private updateDimensionCache() {
-    this.cachedLogicalWidth = this.getLogicalWidth();
-    this.cachedLogicalHeight = this.getLogicalHeight();
-  }
-
-  private getLogicalWidth() {
-    return this.surface.canvas.width / this.surface.pixelRatio;
-  }
-
-  private getLogicalHeight() {
-    return this.surface.canvas.height / this.surface.pixelRatio;
-  }
-
-  private ensureStaticLayers() {
-    const width = this.surface.canvas.width;
-    const height = this.surface.canvas.height;
-
-    if (
-      this.staticLayerSize.width === width &&
-      this.staticLayerSize.height === height &&
-      this.gridLayer !== null &&
-      this.horizonLayer !== null
-    ) {
+    const ctx = this.backCtx;
+    const back = this.backLayer;
+    if (!ctx || !back) {
       return;
     }
-
-    this.staticLayerSize = { width, height };
-
-    this.gridLayer = document.createElement('canvas');
-    this.gridLayer.width = width;
-    this.gridLayer.height = height;
-    const gridCtx = this.gridLayer.getContext('2d');
-    if (gridCtx) {
-      this.renderGridLayer(gridCtx, width, height);
+    const sliceStart = performance.now();
+    while (this.rebuildCursor < this.rebuildQueue.length) {
+      if (this.rebuildQueue[this.rebuildCursor].drawHistory(ctx, this.projection) > 0) {
+        this.backHasContent = true;
+      }
+      this.rebuildCursor += 1;
+      if (!this.paused && performance.now() - sliceStart > 3) {
+        break;
+      }
     }
+    // Canvas drawing is deferred until the layer is read; a 1×1 copy makes this slice pay now.
+    this.flushCtx?.drawImage(back, 0, 0, 1, 1, 0, 0, 1, 1);
+    this.historyRebuildCostMs += performance.now() - sliceStart;
 
-    this.horizonLayer = document.createElement('canvas');
-    this.horizonLayer.width = width;
-    this.horizonLayer.height = height;
-    const horizonCtx = this.horizonLayer.getContext('2d');
-    if (horizonCtx) {
-      this.renderHorizonLayer(horizonCtx, width, height);
-    }
-  }
-
-  private renderGridLayer(ctx: CanvasRenderingContext2D, width: number, height: number) {
-    ctx.save();
-    ctx.clearRect(0, 0, width, height);
-    for (let az = 0; az < 360; az += 30) {
-      ctx.beginPath();
-      const x = az * this.AZIMUTH_TO_NORMALIZED * width;
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, height);
-      ctx.strokeStyle = '#111';
-      ctx.lineWidth = 1;
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  private renderHorizonLayer(ctx: CanvasRenderingContext2D, width: number, height: number) {
-    ctx.save();
-    ctx.clearRect(0, 0, width, height);
-
-    // Scale logical coordinates to physical canvas coordinates
-    const pixelRatio = this.surface.pixelRatio;
-    const base = this.mapAltitude(0) * pixelRatio;
-    const gradientDepth = Math.min(80, this.cachedLogicalHeight * 0.15) * pixelRatio;
-
-    // Offset entire horizon DOWN by 8 logical pixels (outer glow radius)
-    // This allows glow to smoothly pass beneath the visible horizon line
-    const glowOffset = 8 * pixelRatio;
-
-    // Draw opaque fill region starting at offset horizon curve
-    ctx.beginPath();
-    this.traceHorizonCurvePhysical(ctx, width, glowOffset);
-    ctx.lineTo(width, height);
-    ctx.lineTo(0, height);
-    ctx.closePath();
-    ctx.fillStyle = '#070707';
-    ctx.fill();
-
-    // Curved atmospheric glow hugging the horizon (also offset)
-    const gradient = ctx.createLinearGradient(
-      0,
-      base + glowOffset - 30 * pixelRatio,
-      0,
-      base + glowOffset + gradientDepth
-    );
-    gradient.addColorStop(0, 'rgba(255, 255, 255, 0.08)');
-    gradient.addColorStop(0.4, 'rgba(255, 255, 255, 0.18)');
-    gradient.addColorStop(1, 'rgba(5, 5, 5, 0)');
-
-    ctx.beginPath();
-    this.traceHorizonCurvePhysical(ctx, width, glowOffset);
-    ctx.lineTo(width, base + glowOffset + gradientDepth);
-    ctx.lineTo(0, base + glowOffset + gradientDepth);
-    ctx.closePath();
-    ctx.fillStyle = gradient;
-    ctx.fill();
-
-    // Draw horizon line at offset position
-    ctx.beginPath();
-    this.traceHorizonCurvePhysical(ctx, width, glowOffset);
-    ctx.strokeStyle = '#2a2a2a';
-    ctx.lineWidth = 2 * pixelRatio;
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  private traceHorizonCurvePhysical(ctx: CanvasRenderingContext2D, width: number, offsetY: number = 0) {
-    const pixelRatio = this.surface.pixelRatio;
-    ctx.moveTo(0, this.getCurvedHorizonY(0 / pixelRatio) * pixelRatio + offsetY);
-    const steps = Math.max(24, Math.floor(width / (30 * pixelRatio)));
-    const step = width / steps;
-    for (let i = 1; i <= steps; i += 1) {
-      const x = Math.min(width, i * step);
-      const logicalX = x / pixelRatio;
-      ctx.lineTo(x, this.getCurvedHorizonY(logicalX) * pixelRatio + offsetY);
+    if (this.rebuildCursor >= this.rebuildQueue.length) {
+      this.backLayer = this.historyLayer;
+      this.backCtx = this.historyLayer?.getContext('2d') ?? null;
+      this.historyLayer = back;
+      this.historyHasContent = this.backHasContent;
+      for (const renderer of this.rebuildQueue) {
+        renderer.promoteBackLayer();
+      }
+      this.rebuildQueue = [];
+      this.rebuildCursor = -1;
     }
   }
 
-  private blitStaticLayer(layer: HTMLCanvasElement | null, type: 'grid' | 'horizon') {
-    if (!layer) {
-      this.ensureStaticLayers();
-      layer = type === 'grid' ? this.gridLayer : this.horizonLayer;
-      if (!layer) return;
+  private blitLayer(layer: HTMLCanvasElement | null) {
+    if (layer) {
+      this.surface.context.drawImage(layer, 0, 0, this.surface.width, this.surface.height);
     }
-
-    const ctx = this.surface.context;
-    ctx.drawImage(
-      layer,
-      0,
-      0,
-      layer.width,
-      layer.height,
-      0,
-      0,
-      this.cachedLogicalWidth,
-      this.cachedLogicalHeight
-    );
   }
 
   private handleResize = () => {
-    this.surface.resize();
-    this.updateDimensionCache();
-    this.ensureStaticLayers();
-    for (const renderer of this.planetRenderers) {
-      renderer.handleResize(this.surface.canvas, this.surface.pixelRatio);
+    if (!this.surface.resize()) {
+      return;
     }
+    this.projection.setSize(this.surface.width, this.surface.height);
+    this.rebuildStaticLayers();
+    this.starField.invalidate();
+    this.cloudLayer.resize(this.projection, this.surface.width, this.surface.height, this.surface.pixelRatio);
+    this.milkyWay.resize(this.projection, this.surface.width, this.surface.height, this.surface.pixelRatio);
+    this.renderStill();
   };
 }

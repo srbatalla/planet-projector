@@ -72,6 +72,63 @@ export function computeHorizonPoint(request: HorizonPointRequest): HorizonSample
   };
 }
 
+/**
+ * Horizon samples for one body, with `Equator` (the expensive part: light-time, nutation,
+ * aberration) evaluated only on a coarse time grid and interpolated in between. RA/Dec move
+ * smoothly, so the interpolation error is ~0.001° while each sample costs ~15× less.
+ */
+export class InterpolatedHorizonTrack {
+  private readonly nodeMs: number;
+  private readonly nodes = new Map<number, { ra: number; dec: number }>();
+  private readonly date = new Date();
+
+  /** `equatorAt` returns RA (hours) / Dec (degrees) of date for the observer. */
+  constructor(
+    private readonly equatorAt: (date: Date) => { ra: number; dec: number },
+    nodeMinutes: number,
+    private readonly observer: Observer,
+    private readonly refraction: 'normal' | 'none' = 'normal'
+  ) {
+    this.nodeMs = nodeMinutes * 60 * 1000;
+  }
+
+  private node(index: number) {
+    let node = this.nodes.get(index);
+    if (!node) {
+      if (this.nodes.size > 512) {
+        this.nodes.clear();
+      }
+      this.date.setTime(index * this.nodeMs);
+      const equatorial = this.equatorAt(this.date);
+      node = { ra: equatorial.ra, dec: equatorial.dec };
+      this.nodes.set(index, node);
+    }
+    return node;
+  }
+
+  sample(timeMs: number): HorizonSample {
+    const index = Math.floor(timeMs / this.nodeMs);
+    const t = (timeMs - index * this.nodeMs) / this.nodeMs;
+    const a = this.node(index);
+    const b = this.node(index + 1);
+    let raDelta = b.ra - a.ra;
+    if (raDelta > 12) raDelta -= 24;
+    else if (raDelta < -12) raDelta += 24;
+    let ra = a.ra + raDelta * t;
+    if (ra < 0) ra += 24;
+    else if (ra >= 24) ra -= 24;
+    const dec = a.dec + (b.dec - a.dec) * t;
+
+    const time = new Date(timeMs);
+    const horizontal = Horizon(time, this.observer, ra, dec, this.refraction);
+    return {
+      time,
+      altitude: horizontal.altitude,
+      azimuth: normalizeAzimuth(horizontal.azimuth),
+    };
+  }
+}
+
 export const normalizeAzimuth = (degrees: number) => {
   let az = degrees % 360;
   if (az < 0) {
