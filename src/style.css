@@ -1146,3 +1146,252 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
     font-size: 16px;
   }
 }
+
+/* ------------------------------------------------------------------ guide */
+
+.docs-entry {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.docs-button {
+  width: 100%;
+}
+
+.docs-entry-version {
+  margin: 8px 0 0;
+  font-size: 0.6rem;
+  color: var(--faint);
+  text-align: center;
+}
+
+/* Full screen over everything; clear of the notch and home indicator in the installed app. */
+.docs {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  padding-top: env(safe-area-inset-top);
+  background: var(--bg);
+  animation: docs-in 0.18s ease-out;
+}
+
+.docs-header,
+.docs-nav {
+  flex: none;
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left));
+  padding-right: max(16px, env(safe-area-inset-right));
+}
+
+.docs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 10px;
+  padding-bottom: 4px;
+}
+
+.docs-header h1 {
+  margin: 0;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.docs-nav {
+  display: flex;
+  gap: 5px;
+  overflow-x: auto;
+  padding-top: 6px;
+  padding-bottom: 12px;
+  scrollbar-width: none;
+}
+
+.docs-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.docs-nav button {
+  flex: none;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #0d0d0d;
+  color: var(--muted);
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.docs-nav button:hover {
+  color: var(--text);
+  background: #171717;
+}
+
+.docs-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid var(--line);
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a2a transparent;
+}
+
+.docs-body {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 4px max(18px, env(safe-area-inset-right)) calc(48px + env(safe-area-inset-bottom))
+    max(18px, env(safe-area-inset-left));
+  font-size: 0.82rem;
+  line-height: 1.7;
+  color: var(--text);
+}
+
+.docs-body section {
+  padding-top: 12px;
+  scroll-margin-top: 4px;
+}
+
+.docs-body h2 {
+  margin: 18px 0 8px;
+  font-size: 0.98rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.docs-body h3 {
+  margin: 18px 0 4px;
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.docs-body p,
+.docs-body ul,
+.docs-body ol {
+  margin: 6px 0;
+}
+
+.docs-body ul,
+.docs-body ol {
+  padding-left: 1.2em;
+}
+
+.docs-body li {
+  margin: 7px 0;
+}
+
+.docs-body li::marker {
+  color: var(--faint);
+}
+
+.docs-body b {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+/* App labels (button and setting names) read as UI, in a warm tint. */
+.docs-body em {
+  font-style: normal;
+  color: #e3d39a;
+}
+
+.docs-body a {
+  color: #9fb8ff;
+}
+
+.docs-note {
+  padding-left: 10px;
+  border-left: 2px solid var(--line-strong);
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.docs-keys {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 16px;
+  margin: 8px 0;
+}
+
+.docs-keys dt {
+  white-space: nowrap;
+}
+
+.docs-keys dd {
+  margin: 0;
+  color: var(--muted);
+}
+
+.docs-body .docs-deps {
+  padding-left: 0;
+  list-style: none;
+}
+
+.docs-deps li {
+  margin: 10px 0;
+}
+
+.docs-dep-name {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.docs-dep-meta {
+  margin-left: 6px;
+  font-size: 0.72rem;
+  color: var(--faint);
+}
+
+.docs-dep-role {
+  display: block;
+  color: var(--muted);
+}
+
+.docs-subhead {
+  margin-top: 12px !important;
+  font-size: 0.72rem;
+  color: var(--faint);
+}
+
+.docs-body kbd {
+  display: inline-block;
+  min-width: 1.7em;
+  padding: 0 6px;
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: #111111;
+  font: inherit;
+  font-size: 0.72rem;
+  text-align: center;
+}
+
+.docs-version {
+  margin-top: 28px !important;
+  font-size: 0.66rem;
+  color: var(--faint);
+}
+
+@media (pointer: coarse) {
+  .docs-body {
+    font-size: 0.86rem;
+  }
+}
+
+@keyframes docs-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+}

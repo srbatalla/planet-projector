@@ -26,6 +26,7 @@ import {
   type Settings,
   type ViewMode,
 } from './settings';
+import { createDocs } from './ui/docs';
 import { ClipRecorder } from './ui/recorder';
 import {
   libraryAvailable,
@@ -63,6 +64,7 @@ const ICONS = {
   link: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
   record: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="12" r="4" fill="#ff4d4d"/></svg>',
   stop: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="#ff4d4d"/></svg>',
+  book: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6.5C10.3 5.3 7.9 4.8 4.5 5v12.5c3.4-.2 5.8.3 7.5 1.5 1.7-1.2 4.1-1.7 7.5-1.5V5c-3.4-.2-5.8.3-7.5 1.5zM12 6.5V19" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
   locate: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
 };
 
@@ -441,8 +443,28 @@ export function initializeApp() {
   sections.forEach((section) => panelBody.append(section.root));
   const footer = el('p', 'panel-footer');
   footer.innerHTML =
-    'Space pause · +/− speed · R restart · 1/2/3 Dome/Horizon/Spiro · S save · H hide panel<br>Spiro: scroll or pinch to zoom, double-click to reset';
+    'Space pause · +/− speed · R restart · 1/2/3 Dome/Horizon/Spiro · S save · H hide panel · ? guide<br>Spiro: scroll or pinch to zoom, double-click to reset';
   panelBody.append(footer);
+
+  // The guide sits at the bottom of the settings; the sky pauses underneath while it is open.
+  let resumeAfterDocs = false;
+  const docs = createDocs((open) => {
+    if (open) {
+      resumeAfterDocs = !paused;
+      setPaused(true);
+    } else if (resumeAfterDocs) {
+      setPaused(false);
+    }
+  });
+  target.append(docs.root);
+  const docsEntry = el('div', 'docs-entry');
+  const docsButton = el('button', 'tool-button docs-button');
+  docsButton.type = 'button';
+  docsButton.innerHTML = `${ICONS.book}<span>Guide &amp; docs</span>`;
+  docsButton.title = 'Tips, smoother animation, installing as an app (?)';
+  docsButton.addEventListener('click', () => docs.open());
+  docsEntry.append(docsButton, el('p', 'docs-entry-version', `v${__APP_VERSION__} · build ${__BUILD_ID__}`));
+  panelBody.append(docsEntry);
 
   // ------------------------------------------------------------- library
 
@@ -791,7 +813,8 @@ export function initializeApp() {
     hashHandle = window.setTimeout(() => {
       hashHandle = null;
       const encoded = encodeSettings(settings);
-      history.replaceState(null, '', encoded ? `#${encoded}` : location.pathname + location.search);
+      // Keep the entry's state: the open guide marks its history entry so Back can close it.
+      history.replaceState(history.state, '', encoded ? `#${encoded}` : location.pathname + location.search);
     }, 200);
   }
 
@@ -1142,6 +1165,13 @@ export function initializeApp() {
   }
 
   window.addEventListener('keydown', (event) => {
+    // While the guide is open, keys scroll it; only Escape does anything (closes it).
+    if (docs.isOpen()) {
+      if (event.key === 'Escape') {
+        docs.close();
+      }
+      return;
+    }
     const active = document.activeElement;
     if (
       event.metaKey || event.ctrlKey || event.altKey ||
@@ -1175,6 +1205,9 @@ export function initializeApp() {
       case 'h':
       case 'H':
         togglePanel();
+        break;
+      case '?':
+        docs.open();
         break;
       case '+':
       case '=':

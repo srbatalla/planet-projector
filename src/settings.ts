@@ -143,6 +143,7 @@ export const DEFAULTS: Settings = {
   activeFadeRate: 0.0005,
   projection: 'dome',
   stars: 'trails',
+  clouds: 'drift',
   skyTint: true,
   trailStyle: 'glow',
   zoom: 18.48,

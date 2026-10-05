@@ -53,6 +53,8 @@ unaffected.
 ## Using it
 
 - **Presets** are the quickest way in; every setting is in the side panel (bottom sheet on phones).
+- **Guide & docs** at the bottom of the settings (or <kbd>?</kbd>): usage tips, getting 120 fps on
+  iPhone, installing as an offline app, and the dependencies list.
 - **Share**: *Link* copies a compact link (e.g. `#z=AQABARgSCBQAFwEYyAEbARwG`, ~4× shorter) that
   reproduces exactly what you see. While you edit, the address bar shows a readable form
   (`#view=spirograph&bodies=Venus,Earth&perspective=Sun&connect=1…`); both open the same view.
@@ -85,7 +87,7 @@ unaffected.
 - **Phones**: the settings sheet has a grab handle — drag it down to return to the full view,
   swipe up on the bottom bar to open it, or tap the sky.
 - **Keyboard**: <kbd>Space</kbd> play/pause · <kbd>+</kbd>/<kbd>−</kbd> speed · <kbd>R</kbd> restart · <kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd>
-  Dome/Horizon/Spiro · <kbd>S</kbd> save image · <kbd>H</kbd> hide panel.
+  Dome/Horizon/Spiro · <kbd>S</kbd> save image · <kbd>H</kbd> hide panel · <kbd>?</kbd> guide.
 - **Spirograph zoom**: scroll or pinch; double-click resets.
 - **Trail brightness** (horizon view): each trail is a settled streak plus a fresh glow that decays
   with simulated time (*Trails → Active sweep fade*, *Settled brightness*). Completed sweeps keep
