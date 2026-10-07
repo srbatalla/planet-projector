@@ -1,7 +1,9 @@
 import './style.css';
 import { initializeApp } from './app';
+import { guardPageZoom } from './ui/zoomGuard';
 
 initializeApp();
+guardPageZoom();
 
 // Offline + install-to-home-screen in production builds (the dev server stays uncached).
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {

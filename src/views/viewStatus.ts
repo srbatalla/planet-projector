@@ -14,6 +14,8 @@ export type ViewStatus = {
   /** Main-thread time spent in the frame callback. */
   frameWorkMs: number;
   paused: boolean;
+  /** Solar eclipse at the observer (horizon view). */
+  eclipse?: { kind: 'partial' | 'annular' | 'total'; obscuration: number } | null;
 };
 
 /**

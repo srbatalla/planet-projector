@@ -1,4 +1,4 @@
-import type { Point, SkyProjection } from './projection';
+import { BEHIND_CAMERA, type Point, type SkyProjection } from './projection';
 
 /**
  * Growable polyline in horizontal coordinates. Trails are kept as vectors rather than
@@ -208,12 +208,15 @@ function strokePass(
   let prevAz = 0;
   let prevAlt = 0;
   let havePrev = false;
+  let prevFront = true;
 
   for (let i = 0; i < path.length; i += 1) {
     projection.project(az[i], alt[i], scratch);
     const x = scratch.x;
     const y = scratch.y;
-    const isBreak = breaks[i] === 1 || !havePrev;
+    // A camera view cannot draw toward a point behind it: the line would cut across the frame.
+    const front = x !== BEHIND_CAMERA;
+    const isBreak = breaks[i] === 1 || !havePrev || !front || !prevFront;
 
     if (!isBreak) {
       // Age is time distance, so a rewinding trail fades behind the body just the same.
@@ -256,6 +259,7 @@ function strokePass(
     prevY = y;
     prevAz = az[i];
     prevAlt = alt[i];
+    prevFront = front;
     havePrev = true;
   }
 

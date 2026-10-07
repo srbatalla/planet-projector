@@ -3,6 +3,7 @@ import { SPECIAL_OBJECTS } from './core/specialObjects';
 import type { ProjectionKind } from './views/horizon/projection';
 import type { StarMode } from './views/horizon/starField';
 import type { CloudMode } from './views/horizon/cloudLayer';
+import type { LandscapeKind } from './views/horizon/landscape';
 import type { TrailStyle } from './views/horizon/trailPath';
 import type { SpiroColorMode } from './views/spirograph/spirographView';
 
@@ -37,6 +38,11 @@ export type Settings = {
   skyTint: boolean;
   lineWidth: number;
   trailStyle: TrailStyle;
+  /** Scene (perspective) camera: facing azimuth, tilt above the horizon, diagonal field of view. */
+  sceneHeading: number;
+  sceneTilt: number;
+  sceneFov: number;
+  landscape: LandscapeKind;
 
   // Spirograph
   spiroSpeed: number;
@@ -53,6 +59,8 @@ export type Settings = {
   connectDays: number;
   fadeYears: number;
   zoom: number;
+  /** Spiro: "AU" distance labels on the reference rings. */
+  auLabels: boolean;
 
   labels: boolean;
   showStats: boolean;
@@ -100,6 +108,10 @@ export const BASELINE: Settings = {
   skyTint: false,
   lineWidth: 2,
   trailStyle: 'line',
+  sceneHeading: 0,
+  sceneTilt: 16,
+  sceneFov: 80,
+  landscape: 'mountains',
 
   spiroSpeed: 2,
   spiroStepHours: 24,
@@ -114,6 +126,7 @@ export const BASELINE: Settings = {
   connectDays: 4,
   fadeYears: 0,
   zoom: 1,
+  auLabels: true,
 
   labels: true,
   showStats: true,
@@ -298,8 +311,9 @@ export function encodeSettings(settings: Settings): string {
 /** Allowed values for string settings; shared links are untrusted input. */
 const CHOICES: Partial<Record<keyof Settings, readonly string[]>> = {
   view: ['horizon', 'spirograph'],
-  projection: ['panorama', 'dome'],
+  projection: ['panorama', 'dome', 'perspective'],
   stars: ['off', 'points', 'trails'],
+  landscape: ['mountains', 'lake', 'boat'],
   clouds: ['off', 'drift', 'exposure'],
   trailStyle: ['line', 'glow'],
   colorMode: ['planet', 'spectrum', 'mono'],
@@ -321,6 +335,9 @@ const RANGES: Partial<Record<keyof Settings, [number, number]>> = {
   cloudCover: [0, 1],
   checkpoint: [2, 30],
   lineWidth: [0.5, 5],
+  sceneHeading: [0, 359],
+  sceneTilt: [-10, 60],
+  sceneFov: [20, 140],
   spiroSpeed: [-(SPIRO_SPEED_STEPS.length - 1), SPIRO_SPEED_STEPS.length],
   spiroStepHours: [1, 720],
   spiroLineWidth: [0.25, 4],
@@ -378,7 +395,155 @@ export type Preset = {
 
 const thisYear = new Date().getFullYear();
 
+/** The default run as a preset patch: every field where DEFAULTS differs from the baseline. */
+function defaultRunSettings(): Partial<Settings> {
+  const patch: Record<string, unknown> = { view: DEFAULTS.view };
+  for (const key of Object.keys(DEFAULTS) as (keyof Settings)[]) {
+    if (JSON.stringify(DEFAULTS[key]) !== JSON.stringify(BASELINE[key])) {
+      patch[key] = DEFAULTS[key];
+    }
+  }
+  delete patch.showStats;
+  return patch as Partial<Settings>;
+}
+
 export const PRESETS: Preset[] = [
+  {
+    id: 'sydney',
+    label: 'Sydney',
+    hint: 'Every planet over Sydney, with star trails and drifting cloud',
+    // Exactly the default run, so the two never drift apart.
+    settings: { ...defaultRunSettings() },
+  },
+  {
+    id: 'moonrise-sea',
+    label: 'Moonrise at Sea',
+    hint: 'A full Moon rises off Sydney and lays a silver road to your rowboat',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Moon],
+      latitude: -33.8688,
+      longitude: 151.2093,
+      start: '2026-10-26T08:15Z',
+      projection: 'perspective',
+      sceneHeading: 68,
+      sceneTilt: 6,
+      sceneFov: 90,
+      landscape: 'boat',
+      stars: 'trails',
+      clouds: 'drift',
+      cloudCover: 0.3,
+      skyTint: true,
+      jump: 1,
+      horizonSpeed: 2,
+      trailStyle: 'glow',
+    },
+  },
+  {
+    id: 'polar-night',
+    label: 'Polar Night',
+    hint: 'Svalbard at midwinter: the Sun never rises and the full Moon circles the sky',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Moon, Body.Jupiter, Body.Saturn],
+      latitude: 78.2232,
+      longitude: 15.6267,
+      start: '2026-12-21T00:00Z',
+      projection: 'dome',
+      stars: 'trails',
+      milkyWay: true,
+      clouds: 'drift',
+      cloudCover: 0.25,
+      skyTint: true,
+      jump: 1,
+      horizonSpeed: 4,
+      trailStyle: 'glow',
+      activeFadeRate: 0.00002,
+    },
+  },
+  {
+    id: 'mercury-spiro',
+    label: 'Mercury Spirograph',
+    hint: 'Mercury seen from Earth: three loops a year weave a fine silver rosette',
+    settings: {
+      view: 'spirograph',
+      bodies: [Body.Mercury],
+      perspective: Body.Earth,
+      // The shared link's 19:19 local time on 27 Nov 2001, fixed to one instant (UTC−10).
+      start: '2001-11-28T05:19Z',
+      spiroSpeed: 5,
+      colorMode: 'mono',
+      spiroGlow: true,
+      zoom: 1,
+      labels: false,
+      auLabels: false,
+    },
+  },
+  {
+    id: 'equator',
+    label: 'Equator',
+    hint: 'Quito before dawn: Venus and the crescent Moon rise straight up out of the Andes',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Sun, Body.Moon, Body.Venus, Body.Jupiter],
+      latitude: -0.1807,
+      longitude: -78.4678,
+      elevation: 2850,
+      // Venus and the waning crescent rise together at 03:12 local, three hours before the Sun.
+      start: '2026-12-05T07:55Z',
+      projection: 'perspective',
+      sceneHeading: 98,
+      sceneTilt: 24,
+      sceneFov: 100,
+      landscape: 'mountains',
+      stars: 'trails',
+      milkyWay: true,
+      skyTint: true,
+      jump: 1,
+      horizonSpeed: 4,
+      trailStyle: 'glow',
+    },
+  },
+  {
+    id: 'planet-parade',
+    label: 'Planet Parade',
+    hint: 'Every naked-eye planet over a panoramic horizon',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Mercury, Body.Venus, Body.Mars, Body.Jupiter, Body.Saturn],
+      start: 'night',
+      projection: 'panorama',
+      stars: 'points',
+      milkyWay: true,
+      clouds: 'drift',
+      cloudCover: 0.25,
+      skyTint: true,
+      jump: 2,
+      horizonSpeed: 5,
+    },
+  },
+  {
+    id: 'venus-lake',
+    label: 'Venus over the Lake',
+    hint: 'Venus, the evening star, sets beside the crescent Moon, doubled in the water',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Moon, Body.Venus],
+      latitude: 37.7749,
+      longitude: -122.4194,
+      start: '2026-08-16T03:00Z',
+      projection: 'perspective',
+      sceneHeading: 252,
+      sceneTilt: 8,
+      sceneFov: 70,
+      landscape: 'lake',
+      stars: 'trails',
+      skyTint: true,
+      jump: 1,
+      horizonSpeed: 2,
+      trailStyle: 'glow',
+    },
+  },
   {
     id: 'venus-rose',
     label: 'Venus Rose',
@@ -390,6 +555,52 @@ export const PRESETS: Preset[] = [
       spiroSpeed: 4,
       colorMode: 'spectrum',
       spiroGlow: true,
+    },
+  },
+  {
+    id: 'night-dome',
+    label: 'Star Trails',
+    hint: 'Lake Tekapo, New Zealand: star trails wheel around the south pole, mirrored in the lake',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Moon, Body.Mars, Body.Jupiter, Body.Saturn],
+      latitude: -44.0,
+      longitude: 170.48,
+      elevation: 710,
+      start: 'night',
+      projection: 'perspective',
+      sceneHeading: 180,
+      sceneTilt: 20,
+      sceneFov: 100,
+      landscape: 'lake',
+      stars: 'trails',
+      milkyWay: true,
+      skyTint: true,
+      jump: 1,
+      horizonSpeed: 3,
+      trailStyle: 'glow',
+    },
+  },
+  {
+    id: 'eclipse-sydney',
+    label: 'Eclipse over Sydney',
+    hint: '22 Jul 2028: nearly four minutes of totality over the harbour, seen from a rowboat',
+    settings: {
+      view: 'horizon',
+      projection: 'perspective',
+      bodies: [Body.Sun, Body.Moon, Body.Mercury, Body.Venus, Body.Jupiter, Body.Saturn],
+      latitude: -33.8688,
+      longitude: 151.2093,
+      start: '2028-07-22T02:35Z',
+      sceneHeading: 328,
+      sceneTilt: 8,
+      sceneFov: 95,
+      landscape: 'boat',
+      skyTint: true,
+      stars: 'points',
+      horizonSpeed: 2,
+      jump: 1,
+      trailStyle: 'glow',
     },
   },
   {
@@ -408,6 +619,29 @@ export const PRESETS: Preset[] = [
     },
   },
   {
+    id: 'midnight-sun',
+    label: 'Midnight Sun',
+    hint: 'Svalbard in June: the Sun dips toward the northern peaks at midnight and climbs again',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Sun, Body.Moon],
+      latitude: 78.2232,
+      longitude: 15.6267,
+      start: `${thisYear}-06-01T00:00`,
+      projection: 'perspective',
+      sceneHeading: 0,
+      sceneTilt: 12,
+      sceneFov: 110,
+      landscape: 'mountains',
+      skyTint: true,
+      jump: 1,
+      horizonSpeed: 5,
+      trailStyle: 'glow',
+      // Keep each day's full circle: the default sweep fade would erase most of it.
+      activeFadeRate: 0.00001,
+    },
+  },
+  {
     id: 'retrograde',
     label: 'Mars Loops',
     hint: 'Retrograde loops of Mars and Jupiter seen from Earth',
@@ -417,6 +651,30 @@ export const PRESETS: Preset[] = [
       perspective: Body.Earth,
       spiroSpeed: 5,
       spiroGlow: true,
+    },
+  },
+  {
+    id: 'hale-bopp',
+    label: 'Hale-Bopp 1997',
+    hint: 'The great comet over a lake in the northwest dusk, with Mars at opposition',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Mars],
+      specials: ['hale-bopp'],
+      latitude: 37.7749,
+      longitude: -122.4194,
+      start: '1997-03-26T03:00Z',
+      projection: 'perspective',
+      sceneHeading: 308,
+      sceneTilt: 18,
+      sceneFov: 90,
+      landscape: 'lake',
+      stars: 'trails',
+      milkyWay: true,
+      skyTint: true,
+      jump: 1,
+      horizonSpeed: 3,
+      trailStyle: 'glow',
     },
   },
   {
@@ -434,39 +692,6 @@ export const PRESETS: Preset[] = [
       mirror: true,
       spiroLineWidth: 1,
       fadeYears: 12,
-    },
-  },
-  {
-    id: 'great-conjunction',
-    label: 'Great Conjunctions',
-    hint: 'Jupiter–Saturn chords trace a slowly turning triangle',
-    settings: {
-      view: 'spirograph',
-      bodies: [Body.Jupiter, Body.Saturn],
-      perspective: Body.Sun,
-      spiroSpeed: 7,
-      spiroStepHours: 72,
-      connect: true,
-      connectDays: 60,
-      spiroGlow: true,
-      spiroLineWidth: 1,
-      fadeYears: 80,
-    },
-  },
-  {
-    id: 'night-dome',
-    label: 'Star Trails',
-    hint: 'All-sky dome with long-exposure star trails',
-    settings: {
-      view: 'horizon',
-      bodies: [Body.Moon, Body.Mars, Body.Jupiter, Body.Saturn],
-      start: 'night',
-      projection: 'dome',
-      stars: 'trails',
-      milkyWay: true,
-      jump: 1,
-      horizonSpeed: 3,
-      trailStyle: 'glow',
     },
   },
   {
@@ -489,57 +714,59 @@ export const PRESETS: Preset[] = [
     },
   },
   {
-    id: 'midnight-sun',
-    label: 'Midnight Sun',
-    hint: 'Svalbard in June: the Sun circles without setting',
+    id: 'eclipse-spain',
+    label: 'Eclipse over Spain',
+    hint: 'Total solar eclipse, 12 Aug 2026: the low Sun goes dark over the mountains near León',
     settings: {
       view: 'horizon',
-      bodies: [Body.Sun, Body.Moon],
-      latitude: 78.2232,
-      longitude: 15.6267,
-      start: `${thisYear}-06-01T00:00`,
-      projection: 'dome',
+      projection: 'perspective',
+      bodies: [Body.Sun, Body.Moon, Body.Venus, Body.Jupiter],
+      latitude: 42.5987,
+      longitude: -5.5671,
+      start: '2026-08-12T17:25Z',
+      sceneHeading: 281,
+      sceneTilt: 8,
+      sceneFov: 70,
+      landscape: 'mountains',
       skyTint: true,
-      jump: 1,
-      horizonSpeed: 5,
-      trailStyle: 'glow',
-      // Keep each day's full circle: the default sweep fade would erase most of it.
-      activeFadeRate: 0.00001,
-    },
-  },
-  {
-    id: 'planet-parade',
-    label: 'Planet Parade',
-    hint: 'Every naked-eye planet over a panoramic horizon',
-    settings: {
-      view: 'horizon',
-      bodies: [Body.Mercury, Body.Venus, Body.Mars, Body.Jupiter, Body.Saturn],
-      start: 'night',
-      projection: 'panorama',
       stars: 'points',
-      milkyWay: true,
-      skyTint: true,
-      jump: 2,
-      horizonSpeed: 5,
+      horizonSpeed: 2,
+      jump: 1,
+      trailStyle: 'glow',
     },
   },
   {
-    id: 'hale-bopp',
-    label: 'Hale-Bopp 1997',
-    hint: 'The great comet over San Francisco, with Mars at opposition',
+    id: 'great-conjunction',
+    label: 'Great Conjunctions',
+    hint: 'Jupiter–Saturn chords trace a slowly turning triangle',
+    settings: {
+      view: 'spirograph',
+      bodies: [Body.Jupiter, Body.Saturn],
+      perspective: Body.Sun,
+      spiroSpeed: 7,
+      spiroStepHours: 72,
+      connect: true,
+      connectDays: 60,
+      spiroGlow: true,
+      spiroLineWidth: 1,
+      fadeYears: 80,
+    },
+  },
+  {
+    id: 'eclipse-luxor',
+    label: 'Eclipse at Luxor',
+    hint: 'Six minutes of totality near noon, 2 Aug 2027: day turns to night overhead',
     settings: {
       view: 'horizon',
-      bodies: [Body.Mars],
-      specials: ['hale-bopp'],
-      latitude: 37.7749,
-      longitude: -122.4194,
-      start: '1997-03-26T03:00Z',
       projection: 'dome',
-      stars: 'trails',
-      milkyWay: true,
+      bodies: [Body.Sun, Body.Moon, Body.Mercury, Body.Venus, Body.Mars, Body.Jupiter],
+      latitude: 25.6872,
+      longitude: 32.6396,
+      start: '2027-08-02T08:30Z',
       skyTint: true,
+      stars: 'points',
+      horizonSpeed: 2,
       jump: 1,
-      horizonSpeed: 3,
       trailStyle: 'glow',
     },
   },
@@ -559,21 +786,43 @@ export const PRESETS: Preset[] = [
     },
   },
   {
-    id: 'equator',
-    label: 'Equator',
-    hint: 'From Quito, everything rises straight up',
+    id: 'sputnik',
+    label: 'Sputnik 1957',
+    hint: 'Sydney, 7 Oct 1957: watch the sky for the first artificial satellite',
     settings: {
       view: 'horizon',
-      bodies: [Body.Sun, Body.Moon, Body.Venus, Body.Jupiter],
-      latitude: -0.1807,
-      longitude: -78.4678,
-      start: 'night',
-      projection: 'panorama',
+      bodies: [Body.Moon, Body.Venus, Body.Saturn],
+      latitude: -33.8688,
+      longitude: 151.2093,
+      start: '1957-10-07T08:20Z',
+      projection: 'dome',
       stars: 'trails',
-      milkyWay: true,
       skyTint: true,
       jump: 1,
-      horizonSpeed: 5,
+      horizonSpeed: 2,
+      trailStyle: 'glow',
+    },
+  },
+  {
+    id: 'moon-landing',
+    label: 'Moon Landing 1969',
+    hint: 'Madrid, 20 Jul 1969: the crescent Moon over the water as Apollo 11 touches down',
+    settings: {
+      view: 'horizon',
+      bodies: [Body.Moon, Body.Venus, Body.Jupiter],
+      latitude: 40.4168,
+      longitude: -3.7038,
+      start: '1969-07-20T19:50Z',
+      projection: 'perspective',
+      sceneHeading: 240,
+      sceneTilt: 14,
+      sceneFov: 60,
+      landscape: 'lake',
+      stars: 'trails',
+      skyTint: true,
+      jump: 1,
+      horizonSpeed: 2,
+      trailStyle: 'glow',
     },
   },
 ];
@@ -593,7 +842,6 @@ export function applyPreset(current: Settings, preset: Preset): Settings {
     longitude: current.longitude,
     elevation: current.elevation,
     showStats: current.showStats,
-    labels: current.labels,
     ...preset.settings,
     bodies,
   };

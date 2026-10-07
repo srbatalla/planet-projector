@@ -35,14 +35,17 @@ export function skyColors(sunAltitude: number, moonlight = 0) {
     return cachedColors;
   }
   cachedKey = key;
-  const [zenith, horizon] = sunSky(Math.round(sunAltitude * 4) / 4);
-  const night = 1 - Math.min(1, Math.max(0, (sunAltitude + 12) / 8));
-  const moon = moonKey * night;
-  cachedColors = {
-    zenith: rgb(mix(zenith, MOONLIT_ZENITH, moon)),
-    horizon: rgb(mix(horizon, MOONLIT_HORIZON, moon)),
-  };
+  const values = skyColorValues(Math.round(sunAltitude * 4) / 4, moonKey);
+  cachedColors = { zenith: rgb(values.zenith), horizon: rgb(values.horizon) };
   return cachedColors;
+}
+
+/** The same sky colours as 0–255 RGB arrays (for lighting the Scene's landscape). */
+export function skyColorValues(sunAltitude: number, moonlight = 0) {
+  const [zenith, horizon] = sunSky(sunAltitude);
+  const night = 1 - Math.min(1, Math.max(0, (sunAltitude + 12) / 8));
+  const moon = moonlight * night;
+  return { zenith: mix(zenith, MOONLIT_ZENITH, moon), horizon: mix(horizon, MOONLIT_HORIZON, moon) };
 }
 
 function sunSky(altitude: number): [number[], number[]] {
@@ -67,6 +70,11 @@ function sunSky(altitude: number): [number[], number[]] {
  */
 export function starVisibility(sunAltitude: number, moonlight = 0) {
   return Math.max(0, Math.min(1, (-sunAltitude - 3) / 9)) * (1 - 0.5 * moonlight);
+}
+
+/** How far daylight has washed out a long exposure: 0 until the Sun is 4° below, 1 once it is 1° up. */
+export function daylightWash(sunAltitude: number) {
+  return Math.max(0, Math.min(1, (sunAltitude + 4) / 5));
 }
 
 /** Moonlight strength: illuminated fraction, faded in as the Moon climbs out of the horizon haze. */

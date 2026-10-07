@@ -37,7 +37,7 @@ const FIELDS: Field[] = [
   { key: 'cycleLimit', kind: 'fixed', scale: 1, base: 0 },
   { key: 'activeFadeRate', kind: 'fixed', scale: 1e6, base: 0.0001 },
   { key: 'checkpoint', kind: 'fixed', scale: 1, base: 10 },
-  { key: 'projection', kind: 'enum', choices: ['panorama', 'dome'], base: 'panorama' },
+  { key: 'projection', kind: 'enum', choices: ['panorama', 'dome', 'perspective'], base: 'panorama' },
   { key: 'stars', kind: 'enum', choices: ['off', 'points', 'trails'], base: 'points' },
   { key: 'skyTint', kind: 'bool', base: false },
   { key: 'lineWidth', kind: 'fixed', scale: 100, base: 2 },
@@ -62,6 +62,13 @@ const FIELDS: Field[] = [
   { key: 'clouds', kind: 'enum', choices: ['off', 'drift', 'exposure'], base: 'off' },
   { key: 'cloudCover', kind: 'fixed', scale: 100, base: 0.45 },
   { key: 'milkyWay', kind: 'bool', base: false },
+  { key: 'sceneHeading', kind: 'fixed', scale: 1, base: 0 },
+  { key: 'sceneTilt', kind: 'fixed', scale: 1, base: 16 },
+  { key: 'sceneFov', kind: 'fixed', scale: 1, base: 80 },
+  { key: 'landscape', kind: 'enum', choices: ['mountains', 'lake', 'boat'], base: 'mountains' },
+  // Runs always start exactly at the start time now; old links may still carry the flag.
+  { key: 'retired:exactStart', kind: 'bool', base: false },
+  { key: 'auLabels', kind: 'bool', base: true },
 ];
 
 const FORMAT_VERSION = 1;

@@ -1,4 +1,5 @@
 import { Body } from 'astronomy-engine';
+import type { EclipseState } from './eclipse';
 
 /** Default core radius (px) for bodies without a magnitude (comets, interstellar objects). */
 export const DEFAULT_MARKER_RADIUS = 4;
@@ -73,16 +74,21 @@ export function drawMoonDisc(
   radius: number,
   phase: number,
   sunAngle: number,
-  litColor: string
+  litColor: string,
+  darkAlpha = 1
 ) {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(sunAngle);
+  // The unlit part (earthshine) only shows against a dark sky.
+  if (darkAlpha > 0.01) {
+    ctx.globalAlpha = darkAlpha;
+    ctx.fillStyle = 'rgb(44, 50, 62)';
+    ctx.beginPath();
+    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
   ctx.globalAlpha = 1;
-  ctx.fillStyle = 'rgb(44, 50, 62)';
-  ctx.beginPath();
-  ctx.arc(0, 0, radius, 0, Math.PI * 2);
-  ctx.fill();
   if (phase > 0.01) {
     const terminator = radius * (2 * phase - 1);
     ctx.fillStyle = litColor;
@@ -108,4 +114,104 @@ export function drawSunGlow(ctx: CanvasRenderingContext2D, x: number, y: number,
   glow.addColorStop(1, 'rgba(255, 190, 90, 0)');
   ctx.fillStyle = glow;
   ctx.fillRect(x - reach, y - reach, reach * 2, reach * 2);
+}
+
+const smoothstep = (a: number, b: number, x: number) => {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+};
+
+/** Fixed streamer directions and lengths so the corona holds still from frame to frame. */
+const STREAMERS = [0.15, 0.55, 1.05, 1.5, 2.1, 2.6, 3.05, 3.5, 4.0, 4.55, 5.05, 5.6, 6.0].map((angle, i) => ({
+  angle,
+  length: 1.8 + ((i * 7) % 5) * 0.45,
+  width: 0.45 + ((i * 3) % 4) * 0.12,
+}));
+
+/**
+ * The Sun during an eclipse at marker scale: the Moon's dark disc crossing it (offset by the true
+ * separation in solar radii, toward the Moon's real direction on screen), the glow fading with
+ * the remaining light, the diamond ring at the edge of totality, and the corona during it.
+ */
+export function drawEclipsedSun(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  towardMoon: number,
+  radius: number,
+  eclipse: EclipseState,
+  color: string
+) {
+  const scale = radius / eclipse.sunRadius;
+  const offset = eclipse.separation * scale;
+  const moonRadius = eclipse.moonRadius * scale;
+  const mx = x + Math.cos(towardMoon) * offset;
+  const my = y + Math.sin(towardMoon) * offset;
+  const light = 1 - eclipse.obscuration;
+  const total = eclipse.kind === 'total';
+  const corona = total ? 1 : eclipse.moonRadius >= eclipse.sunRadius ? smoothstep(0.985, 0.9995, eclipse.obscuration) : 0;
+
+  ctx.save();
+  if (corona > 0) {
+    const halo = ctx.createRadialGradient(x, y, radius * 0.9, x, y, radius * 4.2);
+    halo.addColorStop(0, `rgba(250, 250, 255, ${0.9 * corona})`);
+    halo.addColorStop(0.18, `rgba(225, 232, 255, ${0.38 * corona})`);
+    halo.addColorStop(1, 'rgba(200, 215, 255, 0)');
+    ctx.fillStyle = halo;
+    ctx.fillRect(x - radius * 4.2, y - radius * 4.2, radius * 8.4, radius * 8.4);
+    for (const streamer of STREAMERS) {
+      const ex = x + Math.cos(streamer.angle) * radius * streamer.length * 1.6;
+      const ey = y + Math.sin(streamer.angle) * radius * streamer.length * 1.6;
+      // Soft, broad petals rather than spikes: a curved tip and a faint fill read as wispy.
+      const ray = ctx.createLinearGradient(x, y, ex, ey);
+      ray.addColorStop(0.3, `rgba(232, 238, 255, ${0.11 * corona})`);
+      ray.addColorStop(1, 'rgba(232, 238, 255, 0)');
+      const nx = -Math.sin(streamer.angle) * radius * streamer.width;
+      const ny = Math.cos(streamer.angle) * radius * streamer.width;
+      const tx = x + (ex - x) * 0.6;
+      const ty = y + (ey - y) * 0.6;
+      ctx.fillStyle = ray;
+      ctx.beginPath();
+      ctx.moveTo(x + nx * 1.6, y + ny * 1.6);
+      ctx.quadraticCurveTo(tx + nx * 0.9, ty + ny * 0.9, ex, ey);
+      ctx.quadraticCurveTo(tx - nx * 0.9, ty - ny * 0.9, x - nx * 1.6, y - ny * 1.6);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+  if (light > 0.0005) {
+    ctx.globalAlpha = Math.min(1, Math.sqrt(light) * 1.2);
+    drawSunGlow(ctx, x, y, radius);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // The Moon: only its overlap with the Sun shows by day; in totality the whole black disc does.
+  ctx.save();
+  if (!total) {
+    ctx.beginPath();
+    ctx.arc(x, y, radius + 0.5, 0, Math.PI * 2);
+    ctx.clip();
+  }
+  ctx.fillStyle = 'rgb(7, 8, 12)';
+  ctx.beginPath();
+  ctx.arc(mx, my, moonRadius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Diamond ring: the last bead of sunlight on the limb just before and after totality.
+  const ring = corona > 0 && !total ? smoothstep(0.97, 0.995, eclipse.obscuration) : 0;
+  if (ring > 0.01) {
+    const bx = x - Math.cos(towardMoon) * radius * 0.95;
+    const by = y - Math.sin(towardMoon) * radius * 0.95;
+    const bead = ctx.createRadialGradient(bx, by, 0, bx, by, radius * 2.6);
+    bead.addColorStop(0, `rgba(255, 255, 255, ${ring})`);
+    bead.addColorStop(0.2, `rgba(255, 250, 235, ${0.55 * ring})`);
+    bead.addColorStop(1, 'rgba(255, 245, 220, 0)');
+    ctx.fillStyle = bead;
+    ctx.fillRect(bx - radius * 2.6, by - radius * 2.6, radius * 5.2, radius * 5.2);
+  }
+  ctx.restore();
 }

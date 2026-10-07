@@ -72,11 +72,11 @@ const ICONS = {
 const LIVE_KEYS: Record<ViewMode, Set<keyof Settings>> = {
   horizon: new Set([
     'horizonSpeed', 'jump', 'bodies', 'specials', 'projection', 'stars', 'milkyWay', 'clouds', 'cloudCover', 'skyTint', 'lineWidth',
-    'trailStyle', 'labels', 'settledBrightness',
+    'trailStyle', 'labels', 'settledBrightness', 'sceneHeading', 'sceneTilt', 'sceneFov', 'landscape',
   ]),
   spirograph: new Set([
     'spiroSpeed', 'bodies', 'specials', 'labels', 'colorMode', 'spiroGlow', 'spiroLineWidth', 'symmetry', 'mirror',
-    'connect', 'connectDays', 'fadeYears', 'zoom',
+    'connect', 'connectDays', 'fadeYears', 'zoom', 'auLabels',
   ]),
 };
 /** Settings that only matter to one view: changing them while in the other view does nothing. */
@@ -84,11 +84,11 @@ const VIEW_KEYS: Record<ViewMode, Set<keyof Settings>> = {
   horizon: new Set([
     'latitude', 'longitude', 'elevation', 'horizonSpeed', 'sampleMinutes', 'jump', 'trailPersistence',
     'cycleLimit', 'activeFadeRate', 'settledBrightness', 'checkpoint', 'projection', 'stars', 'milkyWay', 'clouds', 'cloudCover', 'skyTint',
-    'lineWidth', 'trailStyle',
+    'lineWidth', 'trailStyle', 'sceneHeading', 'sceneTilt', 'sceneFov', 'landscape',
   ]),
   spirograph: new Set([
     'spiroSpeed', 'spiroStepHours', 'perspective', 'colorMode', 'spiroGlow', 'spiroLineWidth',
-    'symmetry', 'mirror', 'connect', 'connectDays', 'fadeYears', 'zoom',
+    'symmetry', 'mirror', 'connect', 'connectDays', 'fadeYears', 'zoom', 'auLabels',
   ]),
 };
 const UI_KEYS = new Set<keyof Settings>(['showStats']);
@@ -99,18 +99,46 @@ const isSheetLayout = () => window.matchMedia('(max-width: 720px)').matches;
  * The three visually distinct modes in the bar. Dome and Horizon are the same sky view with
  * different projections, so links, presets and saved runs keep using view + projection.
  */
-type DisplayModeId = 'dome' | 'horizon' | 'spiro';
+type DisplayModeId = 'dome' | 'horizon' | 'scene' | 'spiro';
 const DISPLAY_MODES: { id: DisplayModeId; label: string; patch: Partial<Settings> }[] = [
   { id: 'dome', label: 'Dome', patch: { view: 'horizon', projection: 'dome' } },
+  { id: 'scene', label: 'Scene', patch: { view: 'horizon', projection: 'perspective' } },
   { id: 'horizon', label: 'Horizon', patch: { view: 'horizon', projection: 'panorama' } },
   { id: 'spiro', label: 'Spiro', patch: { view: 'spirograph' } },
 ];
+
+/** The mode a preset opens in, for its button: the same names as the bar. */
+const LAST_PRESET_KEY = 'planetary-patterns:last-preset';
+
+function readLastPreset(): string | null {
+  try {
+    return localStorage.getItem(LAST_PRESET_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function storeLastPreset(id: string) {
+  try {
+    localStorage.setItem(LAST_PRESET_KEY, id);
+  } catch {
+    // Storage blocked (private mode): the highlight just lasts for this visit.
+  }
+}
+
+function presetModeLabel(patch: Partial<Settings>) {
+  if (patch.view === 'spirograph') {
+    return 'Spiro';
+  }
+  const projection = patch.projection ?? 'panorama';
+  return projection === 'dome' ? 'Dome' : projection === 'perspective' ? 'Scene' : 'Horizon';
+}
 
 function displayMode(settings: Settings): DisplayModeId {
   if (settings.view === 'spirograph') {
     return 'spiro';
   }
-  return settings.projection === 'dome' ? 'dome' : 'horizon';
+  return settings.projection === 'dome' ? 'dome' : settings.projection === 'perspective' ? 'scene' : 'horizon';
 }
 
 export function initializeApp() {
@@ -190,7 +218,11 @@ export function initializeApp() {
   const speedDown = iconButton(ICONS.minus, 'Slower (−)', () => stepSpeed(-1));
   const speedUp = iconButton(ICONS.plus, 'Faster (+)', () => stepSpeed(+1));
   speedGroup.append(speedDown, speedUp);
-  dock.append(viewSwitch, speedGroup, actions);
+  const dockGrabber = el('button', 'dock-grabber');
+  dockGrabber.type = 'button';
+  dockGrabber.setAttribute('aria-label', 'Open settings');
+  dockGrabber.addEventListener('click', () => setPanel(true));
+  dock.append(dockGrabber, viewSwitch, speedGroup, actions);
 
   // ------------------------------------------------------------- panel body
 
@@ -283,14 +315,19 @@ export function initializeApp() {
   toolRow.append(snapshotButton, recordButton, shareButton);
 
   const presetStrip = el('div', 'preset-strip');
+  // The last preset picked keeps a highlight (on this device) even after its settings are tweaked.
+  // A first visit opens on the default run, which is the Sydney preset.
+  let lastPresetId = readLastPreset() ?? (location.hash.length <= 1 ? 'sydney' : null);
   const presetButtons = PRESETS.map((preset) => {
     const button = el('button', 'preset');
     button.type = 'button';
     button.title = preset.hint;
     button.append(el('span', 'preset-label', preset.label));
-    button.append(el('span', 'preset-kind', preset.settings.view === 'spirograph' ? 'Spiro' : 'Sky'));
+    button.append(el('span', 'preset-kind', presetModeLabel(preset.settings)));
     button.addEventListener('click', () => {
       paused = false;
+      lastPresetId = preset.id;
+      storeLastPreset(preset.id);
       settings = applyPreset(settings, preset);
       syncAll();
       persistHash();
@@ -333,6 +370,7 @@ export function initializeApp() {
     presetSection,
     createLibrarySection(),
     bodyControl,
+    sceneSection(update),
     sectionControl(
       'Sky',
       [
@@ -430,6 +468,7 @@ export function initializeApp() {
       'Display',
       [
         toggleControl('labels', 'Body labels', update, undefined, 'Name tags beside each moving body'),
+        toggleControl('auLabels', 'AU labels', update, ['spirograph'], 'Distances on the reference rings'),
         toggleControl('showStats', 'Frame stats', update, undefined, 'Frame rate and main-thread time per frame'),
       ],
       undefined,
@@ -443,7 +482,7 @@ export function initializeApp() {
   sections.forEach((section) => panelBody.append(section.root));
   const footer = el('p', 'panel-footer');
   footer.innerHTML =
-    'Space pause · +/− speed · R restart · 1/2/3 Dome/Horizon/Spiro · S save · H hide panel · ? guide<br>Spiro: scroll or pinch to zoom, double-click to reset';
+    'Space pause · +/− speed · R restart · 1–4 Dome/Scene/Horizon/Spiro · S save · H hide panel · ? guide<br>Spiro: scroll or pinch to zoom, double-click to reset';
   panelBody.append(footer);
 
   // The guide sits at the bottom of the settings; the sky pauses underneath while it is open.
@@ -637,6 +676,7 @@ export function initializeApp() {
     }
     presetButtons.forEach((button, index) => {
       button.classList.toggle('preset-active', isPresetActive(index));
+      button.classList.toggle('preset-selected', PRESETS[index].id === lastPresetId);
     });
   }
 
@@ -754,6 +794,12 @@ export function initializeApp() {
         activeFadeRate: settings.activeFadeRate,
         azimuthCheckpointInterval: settings.checkpoint,
         visuals: horizonVisuals(settings),
+        onHistoryEvent: (note) => showToast(note, undefined, 7000),
+        onSceneCameraChange: (camera) => {
+          settings = { ...settings, sceneHeading: camera.heading, sceneTilt: camera.tilt, sceneFov: camera.fov };
+          syncAll();
+          persistHash();
+        },
       });
     } else {
       view = new SpirographView(canvasHost, {
@@ -800,6 +846,20 @@ export function initializeApp() {
     target!.dataset.panel = open ? 'open' : 'closed';
     panelButton.innerHTML = open ? ICONS.close : ICONS.sliders;
     panelButton.setAttribute('aria-expanded', String(open));
+    if (open) {
+      requestAnimationFrame(revealSelectedPreset);
+    }
+  }
+
+  /** On phones the presets scroll sideways: bring the highlighted one into view. */
+  function revealSelectedPreset() {
+    const selected = presetStrip.querySelector<HTMLElement>('.preset-selected');
+    if (!selected || presetStrip.scrollWidth <= presetStrip.clientWidth) {
+      return;
+    }
+    const strip = presetStrip.getBoundingClientRect();
+    const box = selected.getBoundingClientRect();
+    presetStrip.scrollLeft += box.left - strip.left - (strip.width - box.width) / 2;
   }
 
   function togglePanel() {
@@ -818,7 +878,7 @@ export function initializeApp() {
     }, 200);
   }
 
-  function showToast(message: string, action?: { label: string; run: () => void }) {
+  function showToast(message: string, action?: { label: string; run: () => void }, durationMs?: number) {
     toast.replaceChildren(document.createTextNode(message));
     toast.classList.toggle('actionable', !!action);
     if (action) {
@@ -834,7 +894,7 @@ export function initializeApp() {
     if (toastHandle !== null) {
       window.clearTimeout(toastHandle);
     }
-    toastHandle = window.setTimeout(() => toast.classList.remove('visible'), action ? 5000 : 2600);
+    toastHandle = window.setTimeout(() => toast.classList.remove('visible'), durationMs ?? (action ? 5000 : 2600));
   }
 
   // ------------------------------------------------------------- HUD
@@ -856,6 +916,12 @@ export function initializeApp() {
     } else {
       const persp = BODY_OPTIONS.find((option) => option.value === settings.perspective)?.label ?? settings.perspective;
       metaParts.push(`from ${persp}`);
+    }
+    if (status.eclipse) {
+      const { kind, obscuration } = status.eclipse;
+      const label =
+        kind === 'total' ? 'total solar eclipse' : kind === 'annular' ? 'annular eclipse' : `partial eclipse ${Math.min(99, Math.round(obscuration * 100))}%`;
+      metaParts.push(label);
     }
     const speedNow = settings.view === 'horizon' ? horizonSpeed(settings) : spiroSpeed(settings);
     if (speedNow < 0 && !status.paused && !status.finished) metaParts.push('◀ rewinding');
@@ -1196,6 +1262,7 @@ export function initializeApp() {
       case '1':
       case '2':
       case '3':
+      case '4':
         update(DISPLAY_MODES[Number(event.key) - 1].patch);
         break;
       case 's':
@@ -1461,6 +1528,44 @@ function skyTargets(settings: Settings): SkyTarget[] {
   return [...effectiveBodies(settings).map(bodyTarget), ...selectedSpecials(settings).map(specialTarget)];
 }
 
+const COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+
+/** Camera and landscape for Scene mode; shown only while it is the active mode. */
+function sceneSection(update: UpdateFn): Control {
+  const section = sectionControl(
+    'Scene',
+    [
+      rangeControl('sceneHeading', 'Facing', {
+        min: 0,
+        max: 359,
+        step: 1,
+        format: (v) => `${COMPASS[Math.round(v / 22.5) % 16]} · ${v}°`,
+      }, update),
+      rangeControl('sceneTilt', 'Tilt', { min: 0, max: 45, step: 1, format: (v) => `${v}° up` }, update),
+      rangeControl('sceneFov', 'Field of view', {
+        min: 30,
+        max: 120,
+        step: 1,
+        // As a full-frame lens: the diagonal angle and its equivalent focal length.
+        format: (v) => `${v}° · ${Math.round(21.63 / Math.tan((v * Math.PI) / 360))} mm`,
+      }, update),
+      segmentedControl('landscape', 'Landscape', [
+        { value: 'mountains', label: 'Mountains' },
+        { value: 'lake', label: 'Lake' },
+        { value: 'boat', label: 'Boat' },
+      ], update),
+    ],
+    ['horizon']
+  );
+  return {
+    ...section,
+    sync(settings) {
+      section.sync(settings);
+      section.root.hidden = settings.view !== 'horizon' || settings.projection !== 'perspective';
+    },
+  };
+}
+
 function horizonVisuals(settings: Settings) {
   return {
     projection: settings.projection,
@@ -1473,6 +1578,12 @@ function horizonVisuals(settings: Settings) {
     clouds: settings.clouds,
     cloudCover: settings.cloudCover,
     milkyWay: settings.milkyWay,
+    scene: {
+      heading: settings.sceneHeading,
+      tilt: settings.sceneTilt,
+      fov: settings.sceneFov,
+      landscape: settings.landscape,
+    },
   };
 }
 
@@ -1488,6 +1599,7 @@ function spiroVisuals(settings: Settings) {
     fadeYears: settings.fadeYears,
     zoom: settings.zoom,
     labels: settings.labels,
+    auLabels: settings.auLabels,
   };
 }
 

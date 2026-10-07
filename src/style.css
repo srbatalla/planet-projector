@@ -8,7 +8,7 @@
   --muted: #8d8d88;
   --faint: #55554f;
   --accent: #f6f5ee;
-  --panel-width: 340px;
+  --panel-width: 372px;
   --dock-height: 56px;
   --mono: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', ui-monospace, 'Menlo', monospace;
   font-family: var(--mono);
@@ -25,6 +25,9 @@ html,
 body {
   margin: 0;
   height: 100%;
+  /* No page zoom: it could only start on the bar or the sheet (the sky handles its own pinch),
+     and once zoomed the sky could not zoom the page back out. Scrolling still works. */
+  touch-action: pan-x pan-y;
   background-color: var(--bg);
   color: var(--text);
   overflow: hidden;
@@ -49,8 +52,25 @@ svg {
   display: block;
 }
 
+/* Taps land on the button itself, which carries touch-action: manipulation (no double-tap zoom). */
+button svg,
+button span {
+  pointer-events: none;
+}
+
+/* Zoomed by accident (see zoomGuard.ts): let a pinch anywhere, sky included, zoom back out. */
+.page-zoomed,
+.page-zoomed body,
+.page-zoomed canvas {
+  touch-action: auto !important;
+}
+
 [hidden] {
   display: none !important;
+}
+
+.dock-grabber {
+  display: none;
 }
 
 /* ------------------------------------------------------------------ layout */
@@ -148,11 +168,43 @@ svg {
   }
 
   .dock {
+    position: relative;
     order: 2;
     gap: 6px;
     border-bottom: 0;
     border-top: 1px solid var(--line);
     padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  }
+
+  /* The same handle as the open sheet's, on the closed bar: it can be dragged (or tapped) up. */
+  .app[data-panel='closed'] .dock {
+    padding-top: 16px;
+  }
+
+  .app[data-panel='closed'] .dock-grabber {
+    display: block;
+    position: absolute;
+    top: 0;
+    left: 50%;
+    width: 80px;
+    height: 16px;
+    margin-left: -40px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    touch-action: none;
+  }
+
+  .dock-grabber::before {
+    content: '';
+    position: absolute;
+    top: 6px;
+    left: 21px;
+    width: 38px;
+    height: 4px;
+    border-radius: 2px;
+    background: #3a3a3a;
   }
 
   .dock-speed,
@@ -162,8 +214,8 @@ svg {
 
   /* `.dock` prefix: these must beat the base dock rules that come later in the file. */
   .dock .view-switch button {
-    padding: 4px 7px;
-    letter-spacing: 0.03em;
+    padding: 4px 5px;
+    letter-spacing: 0;
     font-size: 0.62rem;
   }
 
@@ -173,7 +225,7 @@ svg {
   }
 
   .dock .icon-button {
-    width: 36px;
+    width: 34px;
     height: 36px;
   }
 
@@ -219,13 +271,13 @@ svg {
 /* Narrow phones (≤374px): tighten the bar so mode switch, speed and actions still fit. */
 @media (max-width: 374px) {
   .dock .icon-button {
-    width: 33px;
+    width: 31px;
     height: 34px;
   }
 
   .dock .view-switch button {
-    padding: 4px 5px;
-    letter-spacing: 0.02em;
+    padding: 4px 4px;
+    font-size: 0.57rem;
   }
 }
 
@@ -307,7 +359,7 @@ svg {
 
 .view-switch button {
   min-height: 36px;
-  padding: 4px 10px;
+  padding: 4px 8px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   font-size: 0.66rem;
@@ -797,6 +849,17 @@ svg {
   border-color: var(--accent);
 }
 
+/* The last preset picked: a yellow box that stays until another is chosen. */
+.preset.preset-selected {
+  border-color: #e9c46a;
+  background: rgba(233, 196, 106, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(233, 196, 106, 0.55);
+}
+
+.preset-selected .preset-label {
+  color: #f6dc94;
+}
+
 .preset-label {
   font-size: 0.74rem;
 }
@@ -1228,6 +1291,24 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   color: var(--muted);
   font-size: 0.7rem;
   cursor: pointer;
+}
+
+/* Six topics fit across a phone. */
+@media (max-width: 430px) {
+  .docs-nav {
+    gap: 4px;
+  }
+
+  .docs-nav button {
+    padding: 6px 6px;
+  }
+}
+
+@media (max-width: 374px) {
+  .docs-nav button {
+    padding: 5px 5px;
+    font-size: 0.62rem;
+  }
 }
 
 .docs-nav button:hover {

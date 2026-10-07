@@ -28,6 +28,8 @@ export type SpiroVisuals = {
   fadeYears: number;
   zoom: number;
   labels: boolean;
+  /** Distance labels ("1 AU") on the reference rings. */
+  auLabels: boolean;
 };
 
 type SpirographConfig = {
@@ -949,7 +951,7 @@ export class SpirographView {
       ctx.beginPath();
       ctx.arc(cx, cy, r, 0, Math.PI * 2);
       ctx.stroke();
-      if (r > 18) {
+      if (r > 18 && this.config.visuals.auLabels) {
         ctx.fillText(`${Number(au.toFixed(2))} AU`, cx + 4, cy - r - 2);
       }
     }

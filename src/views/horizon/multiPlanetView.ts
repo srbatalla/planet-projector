@@ -1,15 +1,19 @@
-import { Body, Illumination, Observer } from 'astronomy-engine';
+import { Body, Illumination, Observer, SearchAltitude } from 'astronomy-engine';
 import { computeHorizonPoint, type HorizonSample } from '../../core/astro';
 import { CanvasSurface, createLayerCanvas, observeResize } from '../../render/canvas';
 import { drawMarkerLabel, LabelLayout, MARKER_LABEL_FONT } from '../../render/labels';
 import { PlanetRenderer } from './planetRenderer';
-import { createProjection, type Point, type ProjectionKind, type SkyProjection } from './projection';
-import { moonlightStrength, NIGHT_SKY, skyColors, starVisibility } from './sky';
+import { BEHIND_CAMERA, createProjection, type Point, type ProjectionKind, type SkyProjection } from './projection';
+import { NIGHT_LIGHT, type LandscapeKind, type SceneLight } from './landscape';
+import { daylightWash, moonlightStrength, NIGHT_SKY, skyColors, skyColorValues, starVisibility } from './sky';
 import { StarField, type StarMode } from './starField';
 import { CloudLayer, type CloudMode } from './cloudLayer';
 import { MilkyWayLayer } from './milkyWay';
+import { EclipseModel, eclipsedSunAltitude, type EclipseState } from './eclipse';
+import { HistoryLayer } from './historyLayer';
 import {
   DEFAULT_MARKER_RADIUS,
+  drawEclipsedSun,
   drawMoonDisc,
   drawSunGlow,
   MOON_MARKER_RADIUS,
@@ -34,6 +38,8 @@ export type HorizonVisuals = {
   clouds: CloudMode;
   cloudCover: number;
   milkyWay: boolean;
+  /** Camera and landscape for the perspective (Scene) projection. */
+  scene: { heading: number; tilt: number; fov: number; landscape: LandscapeKind };
 };
 
 type MultiPlanetViewConfig = {
@@ -48,7 +54,26 @@ type MultiPlanetViewConfig = {
   activeFadeRate: number;
   azimuthCheckpointInterval: number;
   visuals: HorizonVisuals;
+  /** Scene camera moved by a drag, pinch or wheel on the sky (so settings and the link follow). */
+  onSceneCameraChange?: (camera: { heading: number; tilt: number; fov: number }) => void;
+  /** A historical Easter egg came into play (a spacecraft launch, a Moon landing): its note. */
+  onHistoryEvent?: (note: string) => void;
 };
+
+/**
+ * Inside the polar circles bodies can stay up for most of a day (or never set): their arcs are not
+ * filled in from the rise at a start or landing, which would draw near-full circles at once.
+ */
+const POLAR_CIRCLE_LATITUDE = 66.56;
+/** No rise within this long before a start: the body never set, so its trail opens where it is. */
+const MAX_BACKFILL_MS = 23 * 3600 * 1000;
+
+/** With the day/night sky, skip-ahead lands only once the Sun is this far down (civil dusk). */
+const NIGHT_LANDING_ALTITUDE = -6;
+
+/** Scene camera limits for gestures (degrees). */
+const TILT_RANGE: [number, number] = [-10, 60];
+const FOV_RANGE: [number, number] = [25, 120];
 
 type VisibilityState = {
   sample: HorizonSample;
@@ -138,18 +163,39 @@ export class MultiPlanetView {
   private frameWorkEma = 0;
   private lastFrameDurationMs = 16;
   private lastVisible: VisiblePlanetSample[] = [];
+  private readonly eclipseModel: EclipseModel;
+  private readonly history: HistoryLayer;
+  /** Solar eclipse at the observer for the frame last rendered (null most of the time). */
+  private eclipse: EclipseState | null = null;
+  private rockBuffer: HTMLCanvasElement | null = null;
+  /** Clock for the boat's swell: runs with real time while playing, holds still while paused. */
+  private swellMs = 0;
+  /** While the Scene camera is moving, trails are drawn live instead of from the stale cache. */
+  private cameraMovingUntil = 0;
+  private readonly pointers = new Map<number, { x: number; y: number }>();
+  private gesture: { heading: number; tilt: number; fov: number; x: number; y: number; distance: number; focal: number } | null = null;
+  private dragged = false;
+  private pendingCamera: { heading: number; tilt: number; fov: number } | null = null;
+  private cameraFrame: number | null = null;
   private disconnectResize: (() => void) | null = null;
 
   constructor(private container: HTMLElement, private config: MultiPlanetViewConfig) {
     this.stepMs = Math.max(1, this.config.sampleMinutes * 60 * 1000);
     this.baseTimestamp = this.config.startTime.getTime();
     this.jumpSetting = this.config.jumpSetting;
+    this.eclipseModel = new EclipseModel(this.config.observer);
+    this.history = new HistoryLayer(
+      this.config.observer.latitude,
+      this.config.observer.longitude,
+      (timeMs) => computeHorizonPoint({ body: Body.Moon, observer: this.config.observer, time: new Date(timeMs) }).altitude,
+      (note) => this.config.onHistoryEvent?.(note)
+    );
 
     const canvas = document.createElement('canvas');
     this.container.appendChild(canvas);
     this.surface = new CanvasSurface(canvas);
 
-    this.projection = createProjection(config.visuals.projection);
+    this.projection = this.makeProjection();
     this.projection.setSize(this.surface.width, this.surface.height);
     this.starField = new StarField(
       config.visuals.stars,
@@ -170,10 +216,41 @@ export class MultiPlanetView {
     this.createPlanetRenderers();
     this.simulationFrozen = this.planetRenderers.length === 0;
     this.rebuildStaticLayers();
+    this.attachCameraGestures(canvas);
   }
 
   get canvas() {
     return this.surface.canvas;
+  }
+
+  /** The projection for the current visuals; the Scene's landscape is seeded by the location. */
+  private makeProjection() {
+    const { latitude, longitude } = this.config.observer;
+    const seed = Math.round((latitude + 90) * 1000) * 7919 + Math.round((longitude + 180) * 1000);
+    return createProjection(this.config.visuals.projection, { ...this.config.visuals.scene, seed });
+  }
+
+  /** Sun, Moon and sky colours for projections whose landscape responds to light. */
+  private sceneLight(
+    sun: { altitude: number; azimuth: number },
+    moon: { altitude: number; azimuth: number; light: number },
+    trueSunAltitude = sun.altitude
+  ): SceneLight {
+    if (!this.config.visuals.skyTint) {
+      return NIGHT_LIGHT;
+    }
+    const colors = skyColorValues(sun.altitude, moon.light);
+    return {
+      sunAltitude: sun.altitude,
+      sunTrueAltitude: trueSunAltitude,
+      eclipse: this.eclipse?.darkness ?? 0,
+      sunAzimuth: sun.azimuth,
+      moonAltitude: moon.altitude,
+      moonAzimuth: moon.azimuth,
+      moonLight: moon.light,
+      horizon: colors.horizon,
+      zenith: colors.zenith,
+    };
   }
 
   private createPlanetRenderers() {
@@ -220,29 +297,119 @@ export class MultiPlanetView {
     this.scheduleFrame();
   }
 
+  /**
+   * Start at the chosen moment. Bodies already up have their arcs filled in from where they rose,
+   * so every trail climbs out of the horizon; the rest wait for their rise. With skip-ahead on and
+   * nothing up, the run goes straight to the first rise (after dark with the day/night sky).
+   */
   private seedInitialEntries() {
-    // Initialize: find the earliest upcoming visible arc among all planets
-    let earliestEntryTime: number | null = null;
-    const entryPoints = new Map<PlanetRenderer, PendingEntry>();
-
-    for (const renderer of this.planetRenderers) {
-      const initialSample = renderer.computeSampleAt(this.simTimeMs);
-      const entryPoint = this.isSampleDrawable(initialSample)
-        ? this.findArcEntryPoint(renderer, this.simTimeMs)
-        : this.seekNextVisibleSample(renderer, this.simTimeMs, 0);
-
-      if (entryPoint) {
-        entryPoints.set(renderer, entryPoint);
-        if (earliestEntryTime === null || this.isEarlierInPlay(entryPoint.timeMs, earliestEntryTime)) {
-          earliestEntryTime = entryPoint.timeMs;
+    const anyUp = this.planetRenderers.some((renderer) => this.isSampleDrawable(renderer.computeSampleAt(this.simTimeMs)));
+    if (!anyUp && this.jumpSetting !== 1) {
+      let earliest: number | null = null;
+      for (const renderer of this.planetRenderers) {
+        const entry = this.seekNextVisibleSample(renderer, this.simTimeMs, 0);
+        if (entry && (earliest === null || this.isEarlierInPlay(entry.timeMs, earliest))) {
+          earliest = entry.timeMs;
         }
       }
+      if (earliest !== null) {
+        this.simTimeMs = this.chooseNightLanding(earliest);
+        this.remainderMs = 0;
+      }
     }
+    this.seedRenderersAt(this.simTimeMs);
+  }
 
-    if (earliestEntryTime !== null) {
-      this.simTimeMs = earliestEntryTime;
-      this.remainderMs = 0;
-      this.syncRenderersToEntryPoints(entryPoints, earliestEntryTime);
+  /**
+   * With the day/night sky on, skip-ahead never lands in daylight: a rise during the day is
+   * picked up at that evening's dusk instead, so every cut goes from night to night and the sky
+   * keeps a steady rhythm. Returns `timeMs` unchanged when it is already dark (or in polar day).
+   */
+  private nightLanding(timeMs: number): number {
+    // Tracing the Sun means following its day, so its rises are left where they are.
+    if (!this.config.visuals.skyTint || this.planetRenderers.some((renderer) => renderer.target.body === Body.Sun)) {
+      return timeMs;
+    }
+    const date = new Date(this.baseTimestamp + timeMs);
+    const sun = computeHorizonPoint({ body: Body.Sun, observer: this.config.observer, time: date });
+    if (sun.altitude <= NIGHT_LANDING_ALTITUDE) {
+      return timeMs;
+    }
+    const dusk = SearchAltitude(Body.Sun, this.config.observer, -1, date, 2, NIGHT_LANDING_ALTITUDE);
+    return dusk ? dusk.date.getTime() - this.baseTimestamp : timeMs;
+  }
+
+  /**
+   * Paint a body's arc from where it rose (in play order) up to `timeMs`, step by step along its
+   * real path, so a trail that is already up still climbs out of the horizon. Inside the polar
+   * circles, or for a body that has not set for a day, the trail opens where the body is instead.
+   */
+  private backfillArc(renderer: PlanetRenderer, timeMs: number) {
+    const now = renderer.computeSampleAt(timeMs);
+    const entry = this.findArcEntryPoint(renderer, timeMs);
+    const polar = Math.abs(this.config.observer.latitude) >= POLAR_CIRCLE_LATITUDE;
+    const neverSet = this.isSampleVisible(entry.sample) && Math.abs(timeMs - entry.timeMs) >= MAX_BACKFILL_MS;
+    if (polar || neverSet) {
+      renderer.setLastVisibleSample(now, timeMs);
+      return;
+    }
+    const step = this.direction * this.stepMs;
+    let previous = entry.sample;
+    let previousTime = entry.timeMs;
+    for (let t = entry.timeMs + step; this.isEarlierInPlay(t, timeMs); t += step) {
+      const sample = renderer.computeSampleAt(t);
+      renderer.paintSegment(previous, previousTime, sample, t);
+      previous = sample;
+      previousTime = t;
+    }
+    if (previousTime !== timeMs) {
+      renderer.paintSegment(previous, previousTime, now, timeMs);
+    }
+    renderer.setLastVisibleSample(now, timeMs);
+  }
+
+  /**
+   * Night landing for a rise at `riseMs`. If nothing is up at that dusk (every body rises and
+   * sets by day), look on to the next rise and its dusk, so a cut never lands on an empty night.
+   */
+  private chooseNightLanding(riseMs: number): number {
+    let candidate = riseMs;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const landing = this.nightLanding(candidate);
+      if (landing === candidate) {
+        return landing;
+      }
+      let nextRise: number | null = null;
+      for (const renderer of this.planetRenderers) {
+        if (this.finishedRenderers.has(renderer)) {
+          continue;
+        }
+        if (this.isSampleDrawable(renderer.computeSampleAt(landing))) {
+          return landing;
+        }
+        const entry = this.seekNextVisibleSample(renderer, landing, 0);
+        if (entry && (nextRise === null || entry.timeMs < nextRise)) {
+          nextRise = entry.timeMs;
+        }
+      }
+      if (nextRise === null) {
+        return landing;
+      }
+      candidate = nextRise;
+    }
+    return this.nightLanding(candidate);
+  }
+
+  /** Start every body afresh at `timeMs` (the current sim time): see `initializeRendererEntry`. */
+  private seedRenderersAt(timeMs: number) {
+    this.simTimeMs = timeMs;
+    this.pendingEntryTargets.clear();
+    this.completedPassRenderers.clear();
+    this.spawnWithoutHistory.clear();
+    for (const renderer of this.planetRenderers) {
+      if (!this.finishedRenderers.has(renderer)) {
+        this.initializeRendererEntry(renderer);
+      }
     }
   }
 
@@ -323,8 +490,18 @@ export class MultiPlanetView {
   updateVisuals(visuals: HorizonVisuals) {
     const previous = this.config.visuals;
     this.config.visuals = visuals;
-    if (visuals.projection !== previous.projection) {
-      this.projection = createProjection(visuals.projection);
+    const sceneChanged =
+      visuals.projection === 'perspective' &&
+      (Object.keys(visuals.scene) as (keyof HorizonVisuals['scene'])[]).some((key) => visuals.scene[key] !== previous.scene[key]);
+    const cameraOnly =
+      sceneChanged &&
+      previous.projection === 'perspective' &&
+      visuals.scene.landscape === previous.scene.landscape &&
+      this.projection.setCamera !== undefined;
+    if (cameraOnly) {
+      this.aimCamera();
+    } else if (visuals.projection !== previous.projection || sceneChanged) {
+      this.projection = this.makeProjection();
       this.projection.setSize(this.surface.width, this.surface.height);
       this.rebuildStaticLayers();
       this.starField.invalidate();
@@ -457,6 +634,9 @@ export class MultiPlanetView {
       fps: this.frameIntervalEma > 0 ? 1000 / this.frameIntervalEma : 0,
       frameWorkMs: this.frameWorkEma,
       paused: this.paused,
+      eclipse: this.eclipse
+        ? { kind: this.eclipse.kind, obscuration: this.eclipse.obscuration }
+        : null,
     };
   }
 
@@ -467,8 +647,7 @@ export class MultiPlanetView {
 
     const currentSample = renderer.computeSampleAt(this.simTimeMs);
     if (this.isSampleDrawable(currentSample)) {
-      renderer.setLastVisibleSample(currentSample, this.simTimeMs);
-      this.spawnWithoutHistory.add(renderer);
+      this.backfillArc(renderer, this.simTimeMs);
       return;
     }
 
@@ -478,34 +657,9 @@ export class MultiPlanetView {
     }
   }
 
+  /** The first body joins an empty sky: the same as a start, at the current moment. */
   private reseedAfterPlanetActivation() {
-    this.spawnWithoutHistory.clear();
-    let earliestEntryTime: number | null = null;
-    const entryPoints = new Map<PlanetRenderer, PendingEntry>();
-
-    for (const renderer of this.planetRenderers) {
-      const entryPoint = this.findNextFutureEntryPoint(renderer, this.simTimeMs);
-      if (!entryPoint) {
-        continue;
-      }
-
-      entryPoints.set(renderer, entryPoint);
-      if (earliestEntryTime === null || this.isEarlierInPlay(entryPoint.timeMs, earliestEntryTime)) {
-        earliestEntryTime = entryPoint.timeMs;
-      }
-    }
-
-    if (earliestEntryTime === null) {
-      for (const renderer of this.planetRenderers) {
-        this.initializeRendererEntry(renderer);
-      }
-      return;
-    }
-
-    this.simTimeMs = earliestEntryTime;
-    this.remainderMs = 0;
-    this.syncRenderersToEntryPoints(entryPoints, earliestEntryTime);
-    this.starField.markJump();
+    this.seedInitialEntries();
   }
 
   private findNextFutureEntryPoint(renderer: PlanetRenderer, fromTimeMs: number) {
@@ -698,10 +852,15 @@ export class MultiPlanetView {
       return;
     }
 
-    // Warp to earliest crossing
-    this.simTimeMs = earliestCrossingTime;
+    // Warp to the earliest crossing, or to the following dusk if that rise is in daylight.
+    const landing = this.chooseNightLanding(earliestCrossingTime);
+    this.simTimeMs = landing;
     this.remainderMs = 0;
-    this.syncRenderersToEntryPoints(crossingInfos, earliestCrossingTime);
+    if (landing !== earliestCrossingTime) {
+      this.seedRenderersAt(landing);
+    } else {
+      this.syncRenderersToEntryPoints(crossingInfos, earliestCrossingTime);
+    }
     this.starField.markJump();
   }
 
@@ -913,17 +1072,23 @@ export class MultiPlanetView {
     const width = this.surface.width;
     const height = this.surface.height;
     const absoluteTime = this.baseTimestamp + previewTime;
-    const sun = this.computeSun(absoluteTime);
-    const sunAltitude = sun.altitude;
     const moon = this.computeMoon(absoluteTime);
     const visuals = this.config.visuals;
+    // During a solar eclipse the sky, clouds and landscape are lit as if the Sun were lower.
+    this.eclipse = this.eclipseModel.at(absoluteTime, this.moonPhaseAt(absoluteTime));
+    const trueSun = this.computeSun(absoluteTime);
+    const sun = { azimuth: trueSun.azimuth, altitude: eclipsedSunAltitude(trueSun.altitude, this.eclipse) };
+    const sunAltitude = sun.altitude;
 
+    this.projection.setLighting?.(this.sceneLight(sun, moon, trueSun.altitude));
     // Every full-canvas raster op counts on phones: the sky fill replaces the clear, and the
     // grid is a handful of hairlines drawn directly rather than another full-screen blit.
     if (visuals.skyTint) {
       const colors = skyColors(sunAltitude, moon.light);
       this.projection.fillSky(ctx, colors.zenith, colors.horizon);
       this.drawMoonGlow(ctx, this.projection, moon, sunAltitude);
+    } else if (this.projection.dynamicGround) {
+      this.projection.fillSky(ctx, NIGHT_SKY.zenith, NIGHT_SKY.horizon);
     } else {
       this.surface.clear(NIGHT_SKY.zenith);
     }
@@ -959,11 +1124,16 @@ export class MultiPlanetView {
       visuals.skyTint ? starVisibility(sunAltitude, moon.light) : 1,
       this.surface.canvas.width,
       this.surface.canvas.height,
-      this.surface.pixelRatio
+      this.surface.pixelRatio,
+      visuals.skyTint ? daylightWash(sunAltitude) : 0
     );
     this.drawSkyMoon(ctx, this.projection, moon, absoluteTime);
+    this.drawSkyEclipse(ctx, this.projection);
 
-    this.advanceHistoryRebuild();
+    // A rebuild started mid-pan would already be stale; wait until the camera settles.
+    if (performance.now() >= this.cameraMovingUntil) {
+      this.advanceHistoryRebuild();
+    }
     if (this.historyHasContent) {
       this.blitLayer(this.historyLayer);
     }
@@ -974,6 +1144,8 @@ export class MultiPlanetView {
     for (const renderer of this.planetRenderers) {
       renderer.drawActive(ctx, this.projection, previewTime);
     }
+    this.history.update(absoluteTime);
+    this.history.draw(ctx, this.projection, absoluteTime);
 
     // Clouds veil the trails beneath them; markers and labels stay on top.
     if (this.cloudLayer.enabled) {
@@ -985,8 +1157,27 @@ export class MultiPlanetView {
     this.refreshMarkerRadii(absoluteTime);
     this.drawPreviewSegments(visiblePlanets);
     this.drawMarkers(visiblePlanets);
-    this.blitGround();
-    this.drawMarkerLabels(visiblePlanets);
+    if (this.projection.dynamicGround) {
+      this.projection.drawGround(ctx);
+    } else {
+      this.blitGround();
+    }
+    // On a boat the world sways while the boat stays put: rock what is drawn so far, draw the
+    // names in the same frame, then the deck on top.
+    if (!this.paused) {
+      this.swellMs += this.lastFrameDurationMs;
+    }
+    const motion = this.projection.frameMotion?.(this.swellMs) ?? null;
+    if (motion) {
+      this.rockCanvas(this.surface.canvas, motion, width, height);
+      ctx.save();
+      this.applyRock(ctx, motion, width, height);
+      this.drawMarkerLabels(visiblePlanets);
+      ctx.restore();
+    } else {
+      this.drawMarkerLabels(visiblePlanets);
+    }
+    this.projection.drawForeground?.(ctx);
   }
 
   /**
@@ -1003,18 +1194,23 @@ export class MultiPlanetView {
       return canvas;
     }
     ctx.setTransform(canvas.width / width, 0, 0, canvas.height / height, 0, 0);
-    const projection = createProjection(this.config.visuals.projection);
+    const projection = this.makeProjection();
     projection.setSize(width, height);
     const previewTime = this.previewTimeMs;
     const absoluteTime = this.baseTimestamp + previewTime;
     const visuals = this.config.visuals;
-    const sunAltitude = this.computeSunAltitude(absoluteTime);
+    const trueSun = this.computeSun(absoluteTime);
+    const sun = { azimuth: trueSun.azimuth, altitude: eclipsedSunAltitude(trueSun.altitude, this.eclipse) };
+    const sunAltitude = sun.altitude;
     const moon = this.computeMoon(absoluteTime);
+    projection.setLighting?.(this.sceneLight(sun, moon, trueSun.altitude));
 
     if (visuals.skyTint) {
       const colors = skyColors(sunAltitude, moon.light);
       projection.fillSky(ctx, colors.zenith, colors.horizon);
       this.drawMoonGlow(ctx, projection, moon, sunAltitude);
+    } else if (projection.dynamicGround) {
+      projection.fillSky(ctx, NIGHT_SKY.zenith, NIGHT_SKY.horizon);
     } else {
       ctx.fillStyle = NIGHT_SKY.zenith;
       ctx.fillRect(0, 0, width + 1, height + 1);
@@ -1030,15 +1226,28 @@ export class MultiPlanetView {
       this.surface.height
     );
     this.drawSkyMoon(ctx, projection, moon, absoluteTime);
+    this.drawSkyEclipse(ctx, projection);
     for (const renderer of this.planetRenderers) {
       renderer.drawSnapshot(ctx, projection, previewTime);
     }
+    this.history.draw(ctx, projection, absoluteTime);
     this.cloudLayer.drawSnapshot(ctx, projection, this.projection, this.surface.width, this.surface.height);
     const visiblePlanets = this.lastVisible;
     this.drawPreviewSegments(visiblePlanets, ctx, projection);
     this.drawMarkers(visiblePlanets, ctx, projection);
     projection.drawGround(ctx);
-    this.drawMarkerLabels(visiblePlanets, ctx, projection, width);
+    // Recordings rock with the boat; a still snapshot stays level.
+    const motion = into ? projection.frameMotion?.(this.swellMs) ?? null : null;
+    if (motion) {
+      this.rockCanvas(canvas, motion, width, height);
+      ctx.save();
+      this.applyRock(ctx, motion, width, height);
+      this.drawMarkerLabels(visiblePlanets, ctx, projection, width);
+      ctx.restore();
+    } else {
+      this.drawMarkerLabels(visiblePlanets, ctx, projection, width);
+    }
+    projection.drawForeground?.(ctx);
     return canvas;
   }
 
@@ -1154,7 +1363,8 @@ export class MultiPlanetView {
     moon: { azimuth: number; altitude: number },
     radius: number,
     color: string,
-    absoluteTimeMs: number
+    absoluteTimeMs: number,
+    darkAlpha = 1
   ) {
     const p = this.point;
     projection.project(moon.azimuth, moon.altitude, p);
@@ -1162,7 +1372,58 @@ export class MultiPlanetView {
     const y = p.y;
     const toward = stepToward(moon, this.markerSunAt(absoluteTimeMs), 2, this.markerStep);
     projection.project(toward.azimuth, toward.altitude, p);
-    drawMoonDisc(ctx, x, y, radius, this.moonPhaseAt(absoluteTimeMs), Math.atan2(p.y - y, p.x - x), color);
+    drawMoonDisc(ctx, x, y, radius, this.moonPhaseAt(absoluteTimeMs), Math.atan2(p.y - y, p.x - x), color, darkAlpha);
+    this.drawLandingSite(ctx, projection, moon, x, y, radius, absoluteTimeMs);
+  }
+
+  /**
+   * While astronauts were on the Moon, a glint marks their landing site on the disc, placed by
+   * its selenographic latitude and longitude (lunar north toward the celestial pole; features east
+   * on the Moon appear toward celestial west), with the mission's name beside the Moon.
+   */
+  private drawLandingSite(
+    ctx: CanvasRenderingContext2D,
+    projection: SkyProjection,
+    moon: { azimuth: number; altitude: number },
+    x: number,
+    y: number,
+    radius: number,
+    absoluteTimeMs: number
+  ) {
+    const landing = this.history.landingAt(absoluteTimeMs);
+    if (!landing) {
+      return;
+    }
+    const p = this.point;
+    const pole = stepToward(moon, { azimuth: 0, altitude: this.config.observer.latitude }, 2, this.markerStep);
+    projection.project(pole.azimuth, pole.altitude, p);
+    const length = Math.hypot(p.x - x, p.y - y);
+    if (!(length > 1e-3) || p.x === BEHIND_CAMERA) {
+      return;
+    }
+    const nx = (p.x - x) / length;
+    const ny = (p.y - y) / length;
+    // Celestial west on screen: north turned a quarter clockwise (screen y points down).
+    const wx = -ny;
+    const wy = nx;
+    const DEG = Math.PI / 180;
+    const across = Math.cos(landing.latitude * DEG) * Math.sin(landing.longitude * DEG);
+    const up = Math.sin(landing.latitude * DEG);
+    const gx = x + radius * (across * wx + up * nx);
+    const gy = y + radius * (across * wy + up * ny);
+    ctx.save();
+    const flicker = 0.75 + 0.25 * Math.sin(performance.now() / 180);
+    const glow = ctx.createRadialGradient(gx, gy, 0, gx, gy, 5);
+    glow.addColorStop(0, `rgba(255, 252, 230, ${0.95 * flicker})`);
+    glow.addColorStop(1, 'rgba(255, 240, 200, 0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(gx - 5, gy - 5, 10, 10);
+    ctx.font = '10px "JetBrains Mono", "Fira Code", ui-monospace, monospace';
+    ctx.fillStyle = 'rgba(255, 232, 170, 0.85)';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(landing.label, x + radius + 6, y + radius + 2);
+    ctx.restore();
   }
 
   /**
@@ -1175,7 +1436,12 @@ export class MultiPlanetView {
     moon: { azimuth: number; altitude: number; phase: number },
     absoluteTimeMs: number
   ) {
-    if (moon.altitude < -0.5 || this.planetRenderers.some((renderer) => renderer.target.body === Body.Moon)) {
+    if (
+      moon.altitude < -0.5 ||
+      moon.phase < 0.03 ||
+      this.eclipse !== null ||
+      this.planetRenderers.some((renderer) => renderer.target.body === Body.Moon)
+    ) {
       return;
     }
     const p = this.point;
@@ -1187,8 +1453,35 @@ export class MultiPlanetView {
     ctx.save();
     ctx.fillStyle = bloom;
     ctx.fillRect(p.x - radius * 4, p.y - radius * 4, radius * 8, radius * 8);
-    this.drawMoonShape(ctx, projection, moon, radius, '#e9edf3', absoluteTimeMs);
+    // By day the Moon's unlit side is lost against the blue; only the lit part shows.
+    const sunUp = daylightWash(this.computeSun(absoluteTimeMs).altitude);
+    this.drawMoonShape(ctx, projection, moon, radius, '#e9edf3', absoluteTimeMs, 1 - sunUp);
     ctx.restore();
+  }
+
+  /** The Sun during a solar eclipse, drawn as part of the sky when it is not a traced body. */
+  private drawSkyEclipse(ctx: CanvasRenderingContext2D, projection: SkyProjection) {
+    if (!this.eclipse || this.planetRenderers.some((renderer) => renderer.target.body === Body.Sun)) {
+      return;
+    }
+    this.drawEclipse(ctx, projection, this.eclipse.sun);
+  }
+
+  /** Eclipsed Sun at `at`: larger than the usual marker so the Moon's bite and the corona read. */
+  private drawEclipse(ctx: CanvasRenderingContext2D, projection: SkyProjection, at: { azimuth: number; altitude: number }) {
+    const eclipse = this.eclipse;
+    if (!eclipse) {
+      return;
+    }
+    const p = this.point;
+    projection.project(at.azimuth, at.altitude, p);
+    const x = p.x;
+    const y = p.y;
+    projection.project(eclipse.moon.azimuth, eclipse.moon.altitude, p);
+    const trueRadius = 'focal' in projection ? Number(projection.focal) * eclipse.sunRadius * (Math.PI / 180) : 0;
+    const radius = Math.max(12, trueRadius);
+    const towardMoon = Math.hypot(p.x - x, p.y - y) > 1e-3 ? Math.atan2(p.y - y, p.x - x) : 0;
+    drawEclipsedSun(ctx, x, y, towardMoon, radius, eclipse, '#ffe9a8');
   }
 
   /** The Sun's direction for the Moon's lit limb; it barely moves in 10 simulated minutes. */
@@ -1276,7 +1569,13 @@ export class MultiPlanetView {
       projection.project(previewSample.azimuth, previewSample.altitude, p);
       const radius = this.markerRadius(renderer);
       if (renderer.target.body === Body.Sun) {
-        drawSunGlow(ctx, p.x, p.y, radius);
+        if (!this.eclipse) {
+          drawSunGlow(ctx, p.x, p.y, radius);
+        }
+        continue;
+      }
+      // In an eclipse the Moon is drawn as the silhouette on the Sun.
+      if (renderer.target.body === Body.Moon && this.eclipse) {
         continue;
       }
       // The Moon's disc carries its own shape; a tighter halo keeps the phase readable.
@@ -1299,7 +1598,13 @@ export class MultiPlanetView {
       projection.project(previewSample.azimuth, previewSample.altitude, p);
       const radius = this.markerRadius(renderer);
       if (renderer.target.body === Body.Moon) {
-        this.drawMoonShape(ctx, projection, previewSample, radius, renderer.color, this.baseTimestamp + this.previewTimeMs);
+        if (!this.eclipse) {
+          this.drawMoonShape(ctx, projection, previewSample, radius, renderer.color, this.baseTimestamp + this.previewTimeMs);
+        }
+        continue;
+      }
+      if (renderer.target.body === Body.Sun && this.eclipse) {
+        this.drawEclipse(ctx, projection, previewSample);
         continue;
       }
       ctx.fillStyle = renderer.color;
@@ -1338,8 +1643,16 @@ export class MultiPlanetView {
     ctx.font = MARKER_LABEL_FONT;
     ctx.globalAlpha = 0.85;
     for (const { renderer, previewSample } of visiblePlanets) {
+      // In an eclipse the Moon is the Sun's silhouette: one name is enough.
+      if (this.eclipse && renderer.target.body === Body.Moon) {
+        continue;
+      }
+      // Behind a ridge in Scene mode: the marker is hidden by the land, so is its name.
+      if (projection.skyline && previewSample.altitude < projection.skyline(previewSample.azimuth) - 0.2) {
+        continue;
+      }
       projection.project(previewSample.azimuth, previewSample.altitude, p);
-      const gap = Math.max(9, this.markerRadius(renderer) + 4);
+      const gap = Math.max(this.eclipse && renderer.target.body === Body.Sun ? 16 : 9, this.markerRadius(renderer) + 4);
       drawMarkerLabel(ctx, renderer.target.label, renderer.color, p.x, p.y, width, gap, layout);
     }
     ctx.restore();
@@ -1368,6 +1681,9 @@ export class MultiPlanetView {
       const startX = p.x;
       const startY = p.y;
       projection.project(previewSample.azimuth, previewSample.altitude, p);
+      if (startX === BEHIND_CAMERA || p.x === BEHIND_CAMERA) {
+        continue;
+      }
       ctx.strokeStyle = renderer.color;
       ctx.beginPath();
       ctx.moveTo(startX, startY);
@@ -1393,9 +1709,183 @@ export class MultiPlanetView {
     return { layer, ctx };
   }
 
+  /** Rotate and shift the frame about its centre (logical units), slightly zoomed to hide the edges. */
+  private applyRock(ctx: CanvasRenderingContext2D, motion: { roll: number; offsetY: number; zoom: number }, width: number, height: number) {
+    ctx.translate(width / 2, height / 2 + motion.offsetY);
+    ctx.rotate(motion.roll);
+    ctx.scale(motion.zoom, motion.zoom);
+    ctx.translate(-width / 2, -height / 2);
+  }
+
+  /** Re-draw everything on `canvas` so far, rocked: one copy out and one transformed copy back. */
+  private rockCanvas(canvas: HTMLCanvasElement, motion: { roll: number; offsetY: number; zoom: number }, width: number, height: number) {
+    if (!this.rockBuffer || this.rockBuffer.width !== canvas.width || this.rockBuffer.height !== canvas.height) {
+      this.rockBuffer = createLayerCanvas(canvas.width, canvas.height);
+    }
+    const buffer = this.rockBuffer.getContext('2d');
+    const ctx = canvas.getContext('2d');
+    if (!buffer || !ctx) {
+      return;
+    }
+    buffer.setTransform(1, 0, 0, 1, 0, 0);
+    buffer.drawImage(canvas, 0, 0);
+    ctx.save();
+    const sx = canvas.width / width;
+    const sy = canvas.height / height;
+    ctx.setTransform(sx, 0, 0, sy, 0, 0);
+    this.applyRock(ctx, motion, width, height);
+    ctx.drawImage(this.rockBuffer, 0, 0, width, height);
+    ctx.restore();
+  }
+
+  /**
+   * Point the Scene camera at `config.visuals.scene` in place. Screen-space layers no longer line
+   * up: star trails start a new exposure, sky rasters are re-sampled, and planet trails are drawn
+   * live (all of them) until a fresh history composite has been built for the new view.
+   */
+  private aimCamera() {
+    const { heading, tilt, fov } = this.config.visuals.scene;
+    this.projection.setCamera?.(heading, tilt, fov);
+    this.cameraMovingUntil = performance.now() + 250;
+    this.starField.reproject();
+    this.cloudLayer.resize(this.projection, this.surface.width, this.surface.height, this.surface.pixelRatio);
+    this.milkyWay.resize(this.projection, this.surface.width, this.surface.height, this.surface.pixelRatio);
+    this.historyHasContent = false;
+    this.rebuildQueue = [];
+    this.rebuildCursor = -1;
+    this.historyLayerDirty = true;
+    for (const renderer of this.planetRenderers) {
+      renderer.resetCompositeState();
+    }
+  }
+
+  /** Apply gesture camera changes at most once per frame (raster re-sampling is not free). */
+  private queueCamera(camera: { heading: number; tilt: number; fov: number }) {
+    this.pendingCamera = camera;
+    if (this.cameraFrame !== null) {
+      return;
+    }
+    this.cameraFrame = requestAnimationFrame(() => {
+      this.cameraFrame = null;
+      const next = this.pendingCamera;
+      this.pendingCamera = null;
+      if (!next || this.config.visuals.projection !== 'perspective') {
+        return;
+      }
+      this.config.visuals = { ...this.config.visuals, scene: { ...this.config.visuals.scene, ...next } };
+      this.aimCamera();
+      this.config.onSceneCameraChange?.(next);
+      this.renderStill();
+    });
+  }
+
+  /**
+   * Scene mode: drag the sky to look around (the view follows the finger or mouse), pinch or
+   * scroll to change the field of view. Other projections ignore these events.
+   */
+  private attachCameraGestures(canvas: HTMLCanvasElement) {
+    canvas.style.touchAction = 'none';
+    const isScene = () => this.config.visuals.projection === 'perspective';
+    const spread = () => {
+      const [a, b] = Array.from(this.pointers.values());
+      return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
+    };
+    const centre = () => {
+      const points = Array.from(this.pointers.values());
+      return {
+        x: points.reduce((sum, p) => sum + p.x, 0) / points.length,
+        y: points.reduce((sum, p) => sum + p.y, 0) / points.length,
+      };
+    };
+    // Each change of finger count re-bases the gesture, so lifting one finger never jumps.
+    const begin = () => {
+      const { heading, tilt, fov } = this.config.visuals.scene;
+      const c = centre();
+      const focal = 'focal' in this.projection ? Number(this.projection.focal) : 1;
+      this.gesture = { heading, tilt, fov, x: c.x, y: c.y, distance: spread(), focal };
+    };
+    const clamp = (value: number, [lo, hi]: [number, number]) => Math.max(lo, Math.min(hi, value));
+
+    canvas.addEventListener('pointerdown', (event) => {
+      if (!isScene() || (event.pointerType === 'mouse' && event.button !== 0)) {
+        return;
+      }
+      canvas.setPointerCapture?.(event.pointerId);
+      this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (this.pointers.size === 1) {
+        this.dragged = false;
+      }
+      begin();
+      canvas.style.cursor = 'grabbing';
+    });
+    canvas.addEventListener('pointermove', (event) => {
+      if (!isScene()) {
+        canvas.style.cursor = '';
+        return;
+      }
+      if (!this.pointers.has(event.pointerId) || !this.gesture) {
+        if (event.pointerType === 'mouse') {
+          canvas.style.cursor = 'grab';
+        }
+        return;
+      }
+      this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      const g = this.gesture;
+      const c = centre();
+      const dx = c.x - g.x;
+      const dy = c.y - g.y;
+      if (!this.dragged && Math.hypot(dx, dy) < 4 && this.pointers.size === 1) {
+        return;
+      }
+      this.dragged = true;
+      const fov = this.pointers.size >= 2 && g.distance > 0 ? clamp((g.fov * g.distance) / Math.max(1, spread()), FOV_RANGE) : g.fov;
+      // Degrees per pixel at the centre of the frame, as the lens was when the gesture began.
+      const perPixel = 180 / Math.PI / Math.max(1, g.focal);
+      const heading = (((g.heading - dx * perPixel) % 360) + 360) % 360;
+      const tilt = clamp(g.tilt + dy * perPixel, TILT_RANGE);
+      this.queueCamera({ heading: Math.round(heading * 10) / 10, tilt: Math.round(tilt * 10) / 10, fov: Math.round(fov) });
+    });
+    const release = (event: PointerEvent) => {
+      if (!this.pointers.delete(event.pointerId)) {
+        return;
+      }
+      if (this.pointers.size > 0) {
+        begin();
+      } else {
+        this.gesture = null;
+        canvas.style.cursor = isScene() ? 'grab' : '';
+      }
+    };
+    canvas.addEventListener('pointerup', release);
+    canvas.addEventListener('pointercancel', release);
+    // A drag is not a tap: keep it from reaching the "tap the sky closes the sheet" handler.
+    canvas.addEventListener(
+      'click',
+      (event) => {
+        if (this.dragged) {
+          this.dragged = false;
+          event.stopPropagation();
+        }
+      },
+      true
+    );
+    canvas.addEventListener(
+      'wheel',
+      (event) => {
+        if (!isScene()) {
+          return;
+        }
+        event.preventDefault();
+        const { heading, tilt, fov } = this.pendingCamera ?? this.config.visuals.scene;
+        this.queueCamera({ heading, tilt, fov: Math.round(clamp(fov * Math.exp(event.deltaY * 0.0015), FOV_RANGE)) });
+      },
+      { passive: false }
+    );
+  }
+
   private rebuildStaticLayers() {
     const ground = this.createLogicalLayer();
-    if (ground.ctx) {
+    if (ground.ctx && !this.projection.dynamicGround) {
       this.projection.drawGround(ground.ctx);
     }
     this.groundLayer = ground.layer;

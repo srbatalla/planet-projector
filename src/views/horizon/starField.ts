@@ -1,6 +1,6 @@
 import { computeStarHorizon, createStarTable, type StarTable } from '../../core/stars';
 import { createLayerCanvas } from '../../render/canvas';
-import type { Point, SkyProjection } from './projection';
+import { BEHIND_CAMERA, type Point, type SkyProjection } from './projection';
 
 export type StarMode = 'off' | 'points' | 'trails';
 
@@ -20,6 +20,12 @@ const SIDEREAL_DAY_MS = 86164091;
 /** Fast frames are split so each drawn chord covers at most this much sky rotation. */
 const MAX_SUBSTEP_DEG = 3;
 const MAX_SUBSTEPS = 32;
+/** Visibility is remembered per 5 simulated minutes, for redrawing trails in a new view. */
+const VISIBILITY_BUCKET_MS = 5 * 60 * 1000;
+/** Redraws stop where trails have faded below ~2%. */
+const REBUILD_WINDOW_MS = 3.9 * TRAIL_FADE_SECONDS * 1000;
+/** Alpha steps when redrawing (fewer strokes; fine enough not to band along a trail). */
+const REBUILD_LEVELS = 12;
 
 export class StarField {
   private readonly table: StarTable = createStarTable();
@@ -51,6 +57,17 @@ export class StarField {
   private pendingFade = 0;
   /** Nothing drawn since the layer was created or cleared: skip compositing it. */
   private layerEmpty = true;
+  /** 0 at night → 1 once the Sun is up; recorded trails wash out with it. */
+  private daylight = 0;
+  /**
+   * What the trail layer holds, so it can be redrawn exactly for a new view (camera pan, resize,
+   * projection switch): each continuous stretch of time recorded, with the sky rotation it used,
+   * and how visible the stars were along the way. A star's trail over any stretch is just an arc
+   * of its daily circle, so nothing else is needed.
+   */
+  private exposures: { offsetMs: number; from: number; to: number }[] = [];
+  private readonly visibilityLog = new Map<number, number>();
+  private rebuildPending = false;
   private readonly point: Point = { x: 0, y: 0 };
 
   constructor(
@@ -84,6 +101,7 @@ export class StarField {
     if (mode !== 'trails') {
       this.trailLayer = null;
       this.trailCtx = null;
+      this.exposures = [];
     }
   }
 
@@ -96,11 +114,17 @@ export class StarField {
     this.jumpPending = true;
   }
 
-  /** Drop the trail layer (resize / projection change): it is rebuilt from the next frame. */
+  /** Drop the trail layer (resize / projection change); the trails are redrawn for the new view. */
   invalidate() {
     this.trailLayer = null;
     this.trailCtx = null;
     this.hasPrev = false;
+    this.rebuildPending = true;
+  }
+
+  /** The camera moved: redraw the recorded trails where they now fall, keeping them on the sky. */
+  reproject() {
+    this.rebuildPending = true;
   }
 
   /**
@@ -113,11 +137,13 @@ export class StarField {
     visibility: number,
     pixelWidth: number,
     pixelHeight: number,
-    pixelRatio: number
+    pixelRatio: number,
+    daylight = 0
   ) {
     if (this.mode === 'off') {
       return;
     }
+    this.daylight = Math.min(1, Math.max(0, daylight));
 
     if (this.jumpPending) {
       this.jumpPending = false;
@@ -137,7 +163,7 @@ export class StarField {
     );
 
     if (this.mode === 'trails') {
-      this.drawTrails(ctx, projection, delta, continuous, visibility, pixelWidth, pixelHeight, pixelRatio);
+      this.drawTrails(ctx, projection, absoluteTimeMs, delta, continuous, visibility, pixelWidth, pixelHeight, pixelRatio);
     }
 
     if (visibility > 0.02) {
@@ -168,6 +194,7 @@ export class StarField {
   private drawTrails(
     ctx: CanvasRenderingContext2D,
     projection: SkyProjection,
+    absoluteTimeMs: number,
     deltaMs: number,
     continuous: boolean,
     visibility: number,
@@ -183,7 +210,13 @@ export class StarField {
     }
 
     const gapMs = Math.abs(deltaMs);
-    if (continuous && !fresh && gapMs > 0) {
+    if (continuous && gapMs > 0) {
+      this.recordExposure(this.prevTimeMs, absoluteTimeMs, visibility);
+    }
+    if (this.rebuildPending) {
+      this.rebuildPending = false;
+      this.rebuildTrails(layerCtx, projection, absoluteTimeMs, pixelWidth, pixelHeight);
+    } else if (continuous && !fresh && gapMs > 0) {
       this.pendingFade = 1 - (1 - this.pendingFade) * Math.exp(-gapMs / 1000 / TRAIL_FADE_SECONDS);
       if (this.layerEmpty) {
         this.pendingFade = 0;
@@ -203,9 +236,132 @@ export class StarField {
       }
     }
 
-    if (!this.layerEmpty) {
-      ctx.drawImage(this.trailLayer, 0, 0, pixelWidth / pixelRatio, pixelHeight / pixelRatio);
+    // Daylight drowns a long exposure: recorded trails dim through dawn and are cleared once the
+    // Sun is up, so each night starts fresh.
+    if (this.daylight >= 1 && !this.layerEmpty) {
+      layerCtx.save();
+      layerCtx.setTransform(1, 0, 0, 1, 0, 0);
+      layerCtx.clearRect(0, 0, pixelWidth, pixelHeight);
+      layerCtx.restore();
+      this.layerEmpty = true;
+      this.pendingFade = 0;
+      this.exposures = [];
     }
+
+    if (!this.layerEmpty) {
+      ctx.save();
+      ctx.globalAlpha = 1 - this.daylight;
+      ctx.drawImage(this.trailLayer, 0, 0, pixelWidth / pixelRatio, pixelHeight / pixelRatio);
+      ctx.restore();
+    }
+  }
+
+  /** Note that trails were laid down from `a` to `b` (either order) at this visibility. */
+  private recordExposure(a: number, b: number, visibility: number) {
+    const from = Math.min(a, b);
+    const to = Math.max(a, b);
+    const last = this.exposures[this.exposures.length - 1];
+    if (last && last.offsetMs === this.siderealOffsetMs && from <= last.to + 1 && to >= last.from - 1) {
+      last.from = Math.min(last.from, from);
+      last.to = Math.max(last.to, to);
+    } else {
+      this.exposures.push({ offsetMs: this.siderealOffsetMs, from, to });
+    }
+    const first = Math.floor(from / VISIBILITY_BUCKET_MS);
+    const lastBucket = Math.min(first + 400, Math.floor(to / VISIBILITY_BUCKET_MS));
+    for (let k = first; k <= lastBucket; k += 1) {
+      this.visibilityLog.set(k, visibility);
+    }
+    // Forget what has faded out of reach, in either direction of play.
+    const keep = REBUILD_WINDOW_MS * 1.5;
+    this.exposures = this.exposures.filter((e) => e.to > b - keep && e.from < b + keep);
+    if (this.visibilityLog.size > 2000) {
+      for (const key of this.visibilityLog.keys()) {
+        if (Math.abs(key * VISIBILITY_BUCKET_MS - b) > keep) {
+          this.visibilityLog.delete(key);
+        }
+      }
+    }
+  }
+
+  /**
+   * Redraw every recorded trail for the current view: each exposure's span is replayed as arcs
+   * of the stars' daily circles (≤2° per chord), faded by age and the visibility at the time.
+   * Cloud gaps are not remembered, so a redraw fills them in.
+   */
+  private rebuildTrails(
+    layerCtx: CanvasRenderingContext2D,
+    projection: SkyProjection,
+    nowMs: number,
+    pixelWidth: number,
+    pixelHeight: number
+  ) {
+    layerCtx.save();
+    layerCtx.setTransform(1, 0, 0, 1, 0, 0);
+    layerCtx.clearRect(0, 0, pixelWidth, pixelHeight);
+    layerCtx.restore();
+    this.pendingFade = 0;
+    this.layerEmpty = true;
+
+    const count = this.table.count;
+    const wraps = projection.wrapsAzimuth;
+    const p = this.point;
+    const paths = BANDS.map(() => Array.from({ length: REBUILD_LEVELS }, () => new Path2D()));
+    const stepLimitMs = (2 / 15.041) * 3600000;
+    let drew = false;
+    for (const exposure of this.exposures) {
+      const lo = Math.max(exposure.from, nowMs - REBUILD_WINDOW_MS);
+      const hi = Math.min(exposure.to, nowMs + REBUILD_WINDOW_MS);
+      if (hi <= lo) {
+        continue;
+      }
+      const steps = Math.min(200, Math.max(1, Math.ceil((hi - lo) / stepLimitMs)));
+      for (let k = 0; k <= steps; k += 1) {
+        const t = lo + ((hi - lo) * k) / steps;
+        computeStarHorizon(this.table, t + exposure.offsetMs, this.latitude, this.longitude, this.subAz, this.subAlt);
+        let level = -1;
+        if (k > 0) {
+          const mid = t - (hi - lo) / steps / 2;
+          const visibility = this.visibilityLog.get(Math.floor(mid / VISIBILITY_BUCKET_MS)) ?? 0;
+          const weight = visibility * Math.exp(-Math.abs(nowMs - mid) / 1000 / TRAIL_FADE_SECONDS);
+          level = weight < 0.02 ? -1 : Math.min(REBUILD_LEVELS - 1, Math.floor(weight * REBUILD_LEVELS));
+        }
+        for (let i = 0; i < count; i += 1) {
+          projection.project(this.subAz[i], this.subAlt[i], p);
+          if (
+            level >= 0 &&
+            this.subAlt[i] >= -2 &&
+            this.lastAz[i] !== Infinity &&
+            p.x !== BEHIND_CAMERA &&
+            this.lastX[i] !== BEHIND_CAMERA &&
+            !(wraps && Math.abs(this.subAz[i] - this.lastAz[i]) > 20)
+          ) {
+            const path = paths[this.band[i]][level];
+            path.moveTo(this.lastX[i], this.lastY[i]);
+            path.lineTo(p.x, p.y);
+            drew = true;
+          }
+          this.lastX[i] = p.x;
+          this.lastY[i] = p.y;
+          // Below-horizon points break the trail (their next chord is skipped).
+          this.lastAz[i] = this.subAlt[i] >= -2 ? this.subAz[i] : Infinity;
+        }
+      }
+    }
+    if (!drew) {
+      return;
+    }
+    layerCtx.strokeStyle = '#dfe6ff';
+    layerCtx.lineCap = 'butt';
+    for (let b = 0; b < BANDS.length; b += 1) {
+      layerCtx.lineWidth = BANDS[b].trailWidth;
+      for (let level = 0; level < REBUILD_LEVELS; level += 1) {
+        layerCtx.globalAlpha = BANDS[b].trailAlpha * ((level + 0.5) / REBUILD_LEVELS);
+        layerCtx.stroke(paths[b][level]);
+      }
+    }
+    layerCtx.globalAlpha = 1;
+    this.layerEmpty = false;
   }
 
   /**
@@ -251,6 +407,8 @@ export class StarField {
         // behind thick cloud (a long exposure records nothing there).
         const skip =
           alt[i] < -2 ||
+          p.x === BEHIND_CAMERA ||
+          this.lastX[i] === BEHIND_CAMERA ||
           (wraps && Math.abs(az[i] - this.lastAz[i]) > 20) ||
           (this.occlusion !== null && this.occlusion(p.x, p.y) > 0.45);
         if (!skip) {
@@ -294,6 +452,7 @@ export class StarField {
     const map = source.affineTo(target);
     if (this.mode === 'trails' && this.trailLayer && !this.layerEmpty && map) {
       ctx.save();
+      ctx.globalAlpha = 1 - this.daylight;
       ctx.transform(map.a, map.b, map.c, map.d, map.e, map.f);
       ctx.drawImage(this.trailLayer, 0, 0, sourceWidth, sourceHeight);
       ctx.restore();

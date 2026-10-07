@@ -221,6 +221,7 @@ export class CloudLayer {
     const moonY = Math.cos(light.moonAltitude * DEG) * Math.cos(light.moonAzimuth * DEG);
     const moonZ = Math.sin(light.moonAltitude * DEG);
     const day = smoothstep(-2, 12, sunAlt);
+
     const twilight = smoothstep(-14, -3, sunAlt) * (1 - smoothstep(4, 14, sunAlt));
     // Silver lining: clouds right around a low Sun light up.
     const sunGlow = smoothstep(-8, 0, sunAlt) * (1 - smoothstep(10, 25, sunAlt));

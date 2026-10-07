@@ -9,6 +9,7 @@ const CLOSE_ICON =
 
 const TOPICS: [id: string, label: string][] = [
   ['docs-start', 'Start'],
+  ['docs-scene', 'Scene'],
   ['docs-tips', 'Tips'],
   ['docs-fps', 'FPS'],
   ['docs-install', 'Install'],
@@ -66,11 +67,54 @@ function content() {
     <li><b>Presets</b> (top of settings) are the quickest way in.</li>
     <li><b>Dome</b> is the whole sky as a circle, as if lying on your back looking up: north at
     the top, east on the <em>left</em>. <b>Horizon</b> unrolls the sky into a 360° panorama.
+    <b>Scene</b> looks through a camera lens at a landscape, like a long-exposure photograph.
     <b>Spiro</b> draws orbits as seen from one body (<em>Frame → Seen from</em>).</li>
     <li><b>−</b> / <b>+</b> in the bar change speed. Below 1× time runs backward (◀): arcs
     replay from where bodies set back to where they rose.</li>
     <li>Pick where you are under <em>Place</em>, or tap the target button to use your
     location. <em>Start</em> sets when: <em>Now</em>, <em>Night</em> (next nightfall), or any date.</li>
+  </ul>
+</section>
+
+<section id="docs-scene">
+  <h2>Scene mode</h2>
+  <p>Scene looks at the sky through a camera lens, standing in a landscape, like a long-exposure
+  photograph. The view is a true perspective: straight lines stay straight, so star trails curve
+  around the celestial pole exactly as they do in a real photo.</p>
+  <h3>Looking around</h3>
+  <ul>
+    <li><b>Drag</b> the sky to turn and tilt the camera; <b>pinch</b> or <b>scroll</b> to zoom
+    the lens. The same controls are under <em>Scene</em> in the settings: <em>Facing</em>,
+    <em>Tilt</em>, <em>Field of view</em> (with the equivalent camera lens in mm) and
+    <em>Landscape</em>.</li>
+    <li>The landscape stays put on the compass as you turn, and star trails stay pinned to the
+    sky: moving the camera redraws them from the exposure so far.</li>
+  </ul>
+  <h3>Landscapes</h3>
+  <ul>
+    <li><b>Mountains:</b> ridgelines fading into the distance, with trees. Planets set behind
+    the peaks rather than at a flat horizon.</li>
+    <li><b>Lake:</b> a still lake mirrors the sky, star trails and planets, rippling gently.</li>
+    <li><b>Boat:</b> you sit in a small rowboat at sea, rocking in the swell, with the oars
+    resting on the water. The Moon, or a low Sun, lays a glittering road across the waves.</li>
+  </ul>
+  <h3>Light</h3>
+  <ul>
+    <li>With <em>Daylight sky</em> on, the land is lit by the real sky: hazy blue by day, warm
+    rim light on the ridges at sunset, dark silhouettes against a faint glow at night, and a cool
+    silver under a bright Moon. Clouds and the Milky Way sit behind the landscape.</li>
+    <li>In a total eclipse the day turns to twilight, with a sunset glow all around the
+    horizon.</li>
+  </ul>
+  <h3>Composing a shot</h3>
+  <ul>
+    <li>Face the celestial pole (south from the southern hemisphere, north from the northern)
+    for circling star trails; face east or west for long diagonal streaks. Near the equator,
+    everything rises straight up.</li>
+    <li>A wide lens (90–110°) suits star trails; a narrower one (40–60°) brings a planet and the
+    Moon close together. Lower the tilt to show more water or land.</li>
+    <li>Presets to start from: <em>Moonrise at Sea</em>, <em>Star Trails</em>,
+    <em>Equator</em>, <em>Venus over the Lake</em> and <em>Eclipse over Sydney</em>.</li>
   </ul>
 </section>
 
@@ -83,10 +127,18 @@ function content() {
     <li><b>A real night sky:</b> turn on <em>Daylight sky</em> and <em>Milky Way</em>. The Milky
     Way only shows in true darkness; a bright Moon washes it out, tints the sky blue and lights
     up the clouds around it. Pick a date near new Moon for the darkest skies.</li>
+    <li><b>Solar eclipses</b> happen on their real dates and paths: the Moon crosses the Sun,
+    the sky darkens and totality turns day to night, with a corona. Totality lasts only minutes,
+    so at high speed it passes in a blink: pause to linger. See the <em>Eclipse</em> presets.</li>
+    <li><b>History:</b> some dates hide a surprise or two in the sky. Try the
+    <em>Sputnik 1957</em> and <em>Moon Landing 1969</em> presets, then go looking for others.</li>
     <li><b>Skip ahead between arcs</b> (<em>Time</em>) jumps over the hours when nothing you
-    trace is up, so sweeps follow each other without waiting.</li>
-    <li>When a traced body is already up at the start, the run begins at its rise so the whole
-    arc is drawn. That is why the clock can show a negative time at first.</li>
+    trace is up, so sweeps follow each other without waiting. With <em>Daylight sky</em> on,
+    jumps always land after sundown (bodies that rose by day are picked up at dusk), so the
+    sky goes from night to night instead of flickering between day and night.</li>
+    <li>A run starts exactly at its start time. Bodies already up have their arc drawn in from
+    where they rose, so trails always climb out of the horizon (except inside the polar circles,
+    where they start where they are).</li>
     <li><b>Spiro:</b> try <em>Connect bodies</em> (chords between two planets),
     <em>Symmetry</em> with <em>Mirror</em>, and a different <em>Seen from</em>. Pinch or scroll
     to zoom; double-click resets.</li>
@@ -100,7 +152,7 @@ function content() {
   <dl class="docs-keys">
     <dt><kbd>Space</kbd></dt><dd>Play / pause</dd>
     <dt><kbd>+</kbd> <kbd>−</kbd></dt><dd>Faster / slower (below 1× rewinds)</dd>
-    <dt><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></dt><dd>Dome / Horizon / Spiro</dd>
+    <dt><kbd>1</kbd>–<kbd>4</kbd></dt><dd>Dome / Scene / Horizon / Spiro</dd>
     <dt><kbd>R</kbd></dt><dd>Restart</dd>
     <dt><kbd>S</kbd></dt><dd>Save an image</dd>
     <dt><kbd>H</kbd></dt><dd>Hide or show the panel</dd>
